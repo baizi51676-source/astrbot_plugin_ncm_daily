@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from astrbot.api import logger
@@ -30,7 +31,9 @@ PAGE_SIZE = 200  # 歌单歌曲列表每页数量
 MSG_LIMIT = 4000  # 单条消息安全长度（字符），超出则截断并提示翻页
 POINT_CMD = "点歌"  # 点歌指令前缀
 POINT_LIMIT = 10  # 点歌搜索结果数量
-WAIT_TIMEOUT = 120  # 交互等待超时（秒）
+DAILY_CMDS = ("日推", "今日推荐")  # 日推指令
+WAIT_TIMEOUT = 120  # 歌单/日推交互等待超时（秒）
+POINT_TIMEOUT = 30  # 点歌交互等待超时（秒，默认）
 
 
 class NcmDailyPlugin(Star):
@@ -50,6 +53,45 @@ class NcmDailyPlugin(Star):
         self.point_allowlist = {
             str(x).strip() for x in raw_allow if str(x).strip()
         }
+        # 点歌交互超时（秒，默认 30）
+        try:
+            self.point_timeout = max(5, int(config.get("point_timeout", POINT_TIMEOUT)))
+        except (TypeError, ValueError):
+            self.point_timeout = POINT_TIMEOUT
+
+    # ---------- 等待状态与超时 ----------
+
+    def _start_timeout_task(
+        self, key: str, state: dict, event: AstrMessageEvent
+    ) -> None:
+        """注册等待状态后启动超时主动提示任务：到期自动发消息提醒用户。"""
+        try:
+            asyncio.create_task(self._timeout_worker(key, state, event))
+        except RuntimeError:
+            pass  # 事件循环不可用时（极少数场景）退化为仅清理
+
+    async def _timeout_worker(
+        self, key: str, state: dict, event: AstrMessageEvent
+    ) -> None:
+        """超时任务：state 的 expiry 更新后自动适应，用户已操作则静默退出。"""
+        try:
+            while True:
+                remaining = state["expiry"] - time.time()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(remaining, 1))
+            # 状态仍是同一个（未被用户操作清理）才提示
+            if self._waiting.get(key) is state:
+                self._waiting.pop(key, None)
+                mode = state.get("mode", "")
+                tip = {
+                    "point": "点歌超时",
+                    "daily": "日推选择超时",
+                    "playlist": "选择超时",
+                }.get(mode, "选择超时")
+                await event.send(event.plain_result(f"{tip}，已退出。可重新发起。"))
+        except Exception as e:
+            logger.warning(f"[ncm] 超时任务异常: {e}")
 
     # ---------- 权限 ----------
 
@@ -248,6 +290,11 @@ class NcmDailyPlugin(Star):
             await self._point_song(event, key, text[len(POINT_CMD):].strip())
             return
 
+        # 日推指令（仅管理员，admin_only 可关）：日推 / 今日推荐
+        if text in DAILY_CMDS:
+            await self._daily_recommend(event, key)
+            return
+
         if text not in ("我的歌单", "歌单", "查看歌单"):
             return
         event.stop_event()
@@ -270,13 +317,16 @@ class NcmDailyPlugin(Star):
             return
 
         # 先注册等待状态，再发送列表（不依赖 yield 之后代码执行）
-        self._waiting[key] = {
+        state = {
             "playlists": playlists,
             "tracks": [],
             "offset": 0,
             "expiry": time.time() + WAIT_TIMEOUT,
+            "mode": "playlist",
         }
+        self._waiting[key] = state
         logger.debug(f"[ncm] 已注册等待状态: {key}")
+        self._start_timeout_task(key, state, event)
 
         items = [f"{i}. {pl.get('name')}（{pl.get('trackCount')} 首）" for i, pl in enumerate(playlists, 1)]
         await self._send_text_list(
@@ -319,13 +369,16 @@ class NcmDailyPlugin(Star):
             return
 
         # 注册等待状态（点歌模式：playlists 为空，tracks=搜索结果）
-        self._waiting[key] = {
+        state = {
             "playlists": [],
             "tracks": songs,
             "offset": 0,
-            "expiry": time.time() + WAIT_TIMEOUT,
+            "expiry": time.time() + self.point_timeout,
+            "mode": "point",
         }
+        self._waiting[key] = state
         logger.debug(f"[ncm] 点歌已注册等待状态: {key}")
+        self._start_timeout_task(key, state, event)
 
         items = [self._format_song(i, s) for i, s in enumerate(songs, 1)]
         await self._send_text_list(
@@ -333,6 +386,46 @@ class NcmDailyPlugin(Star):
             f"🎵 「{keyword}」的搜索结果：",
             items,
             hint="回复序号播放，或直接回复歌名重新搜索",
+        )
+
+    async def _daily_recommend(
+        self, event: AstrMessageEvent, key: str
+    ) -> None:
+        """日推指令：列出今日推荐（合并消息卡片），回复序号播放。"""
+        event.stop_event()
+        if self.admin_only and not self._is_admin(event):
+            await event.send(event.plain_result(self._admin_tip()))
+            return
+        if not self.ncm.logged_in:
+            await event.send(event.plain_result(COOKIE_TIP))
+            return
+        try:
+            songs = self.ncm.get_daily_recommend()
+        except NCMError as e:
+            await event.send(event.plain_result(f"获取每日推荐失败：{e}"))
+            return
+        if not songs:
+            await event.send(event.plain_result("今日日推为空，可能是 Cookie 已失效"))
+            return
+
+        # 注册等待状态（日推模式：playlists 为空，tracks=日推列表）
+        state = {
+            "playlists": [],
+            "tracks": songs,
+            "offset": 0,
+            "expiry": time.time() + WAIT_TIMEOUT,
+            "mode": "daily",
+        }
+        self._waiting[key] = state
+        logger.debug(f"[ncm] 日推已注册等待状态: {key}")
+        self._start_timeout_task(key, state, event)
+
+        items = [self._format_song(i, s) for i, s in enumerate(songs, 1)]
+        await self._send_text_list(
+            event,
+            "🎵 今日推荐（回复序号播放，仅你本人可操作）：",
+            items,
+            hint="回复序号播放，或直接回复歌名搜索",
         )
 
     async def _handle_input(self, event: AstrMessageEvent, key: str, state: dict) -> None:

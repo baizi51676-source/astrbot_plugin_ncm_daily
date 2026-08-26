@@ -17,5 +17,11 @@
     "type": "list",
     "items": {"type": "string"},
     "default": []
+  },
+  "point_timeout": {
+    "description": "点歌交互超时（秒）",
+    "hint": "点歌列出搜索结果后，等待用户回复序号的超时时间；超时后机器人会主动发消息提示并退出。默认 30 秒，最小 5 秒。",
+    "type": "int",
+    "default": 30
   }
 }
