@@ -5,3 +5,13 @@ help: 点歌/搜索无需配置；每日推荐和个人歌单需配置 MUSIC_U C
 version: v1.1.1
 author: baizi51676-source
 repo: https://github.com/baizi51676-source/astrbot_plugin_ncm_daily
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+category: 娱乐
+tags:
+  - 网易云
+  - 音乐
+  - 点歌
+  - 日推
+  - 歌单
