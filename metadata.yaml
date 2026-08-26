@@ -2,6 +2,6 @@ name: astrbot_plugin_ncm_daily
 display_name: 网易云日推及歌单查看
 desc: 网易云音乐助手：搜索音乐、点歌、每日推荐、个人歌单，支持发送 QQ 音乐卡片
 help: 点歌/搜索无需配置；每日推荐和个人歌单需配置 MUSIC_U Cookie 且仅管理员可用
-version: v1.0.0
+version: v1.1.0
 author: baizi51676-source
 repo: https://github.com/baizi51676-source/astrbot_plugin_ncm_daily
