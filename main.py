@@ -13,7 +13,8 @@ from __future__ import annotations
 import time
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Node, Nodes, Plain
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
@@ -412,7 +413,12 @@ class NcmDailyPlugin(Star):
         items: list[str],
         hint: str = "",
     ) -> None:
-        """把列表作为一条普通文本消息发出；超过 MSG_LIMIT 字符时截断并提示翻页。"""
+        """以合并转发（聊天记录卡片）形式发送列表：卡片内仅一条消息（完整多行文本）。
+
+        聊天界面只显示一个卡片，不占屏、不被 QQ 折叠拆分；点开后就是完整的
+        多行文本（类似直接回复文本的效果）。超过 MSG_LIMIT 字符时截断并提示翻页。
+        发送失败（非 aiocqhttp 平台等）自动降级为普通文本消息。
+        """
         text = title + "\n" + "\n".join(items)
         truncated = False
         if len(text) > MSG_LIMIT:
@@ -434,6 +440,22 @@ class NcmDailyPlugin(Star):
                 )
         if hint:
             text += "\n" + hint
+
+        try:
+            self_id = str(getattr(event, "get_self_id", lambda: "0")() or "0")
+        except Exception:
+            self_id = "0"
+        # 合并转发卡片：仅一条 node，内容为完整多行文本
+        try:
+            node = Node(
+                content=[Plain(text)],
+                name="网易云音乐助手",
+                uin=self_id,
+            )
+            await event.send(MessageChain([Nodes([node])]))
+            return
+        except Exception as e:
+            logger.warning(f"[ncm] 合并转发发送失败，降级为普通消息: {e}")
         await event.send(event.plain_result(text))
 
     async def _send_song_list(
