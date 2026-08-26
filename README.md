@@ -1,4 +1,4 @@
-# 网易云音乐助手 (astrbot_plugin_ncm_daily)
+# 网易云日推及歌单查看 (astrbot_plugin_ncm_daily)
 
 > ## ⚠️ 安全与时效提醒
 > - **安全**：`MUSIC_U` 相当于网易云账号登录态，**请勿分享给任何人**（群聊、公开仓库、截图等都不行）
