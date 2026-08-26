@@ -12,8 +12,8 @@
     "default": true
   },
   "point_song_allowlist": {
-    "description": "点歌白名单 QQ 列表",
-    "hint": "填写 QQ 号（字符串数组），如 [\"10001\"]。留空表示不限制（所有人都可以点歌）；管理员始终可以点歌。",
+    "description": "音乐功能白名单 QQ 列表（点歌/搜索/音乐卡片）",
+    "hint": "填写 QQ 号（字符串数组），如 [\"10001\"]。控制「点歌」指令与 LLM 工具的搜索/播放；留空表示不限制（所有人都可以使用）；管理员始终可以使用。",
     "type": "list",
     "items": {"type": "string"},
     "default": []

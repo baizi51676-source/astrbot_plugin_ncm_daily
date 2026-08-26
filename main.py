@@ -157,6 +157,9 @@ class NcmDailyPlugin(Star):
             keyword(string): 搜索关键词，歌名或歌手
             limit(int): 返回数量，默认 10，最大 20
         """
+        # 白名单控制（管理员/白名单用户；白名单为空=不限制），防止任意调用触发风控
+        if not self._can_point_song(event):
+            return "你没有使用音乐功能的权限（需加入插件配置 point_song_allowlist 白名单）。"
         limit = max(1, min(int(limit), 20))
         try:
             songs = self.ncm.search_songs(keyword, limit)
@@ -245,6 +248,9 @@ class NcmDailyPlugin(Star):
             song_id(int): 网易云歌曲 ID（来自搜索/日推/歌单结果）
             song_name(string): 歌曲名称，用于发送失败时的提示（可选）
         """
+        # 白名单控制（管理员/白名单用户；白名单为空=不限制）
+        if not self._can_point_song(event):
+            return "你没有使用音乐功能的权限（需加入插件配置 point_song_allowlist 白名单）。"
         name = song_name or f"id={song_id}"
         ok = await self.sender.send_music_card(event, song_id)
         if ok:
