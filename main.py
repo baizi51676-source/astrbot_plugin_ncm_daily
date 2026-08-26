@@ -3,8 +3,9 @@
 功能：
 - 搜索音乐（无需 Cookie）
 - 发送网易云音乐卡片（QQ 群/私聊，NapCat 渲染）
-- 每日推荐（需 MUSIC_U Cookie）
-- 个人歌单（需 MUSIC_U Cookie）
+- 每日推荐（需 MUSIC_U Cookie，仅管理员）
+- 个人歌单（需 MUSIC_U Cookie，仅管理员）
+- 点歌指令（白名单用户）
 """
 
 from __future__ import annotations
@@ -12,8 +13,7 @@ from __future__ import annotations
 import time
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Node, Nodes, Plain
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
@@ -25,7 +25,10 @@ COOKIE_TIP = (
     "（浏览器登录 music.163.com 后按 F12 → 网络 → 复制任意请求 Cookie 里的 MUSIC_U 值）。"
 )
 
-PAGE_SIZE = 30  # 歌单歌曲列表每页数量
+PAGE_SIZE = 200  # 歌单歌曲列表每页数量
+MSG_LIMIT = 4000  # 单条消息安全长度（字符），超出则截断并提示翻页
+POINT_CMD = "点歌"  # 点歌指令前缀
+POINT_LIMIT = 10  # 点歌搜索结果数量
 WAIT_TIMEOUT = 120  # 交互等待超时（秒）
 
 
@@ -39,6 +42,36 @@ class NcmDailyPlugin(Star):
         """等待交互状态：key = "{origin}:{sender}"，仅发起者本人可操作。
         字段：playlists / tracks / offset / expiry
         """
+        # 管理员 QQ 列表（我的歌单/歌单详情/日推 仅管理员可用；aiocqhttp 平台
+        # event.is_admin() 恒为 False，故用配置列表兜底）
+        raw_admin = config.get("admin_user_ids", []) or []
+        self.admin_ids = {
+            str(x).strip() for x in raw_admin if str(x).strip()
+        }
+        # 点歌白名单 QQ 列表；为空 = 不限制；管理员始终可点歌
+        raw_allow = config.get("point_song_allowlist", []) or []
+        self.point_allowlist = {
+            str(x).strip() for x in raw_allow if str(x).strip()
+        }
+
+    # ---------- 权限 ----------
+
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        """是否管理员：event.is_admin()（部分平台有效）或配置的 admin_user_ids。"""
+        try:
+            if event.is_admin():
+                return True
+        except Exception:
+            pass
+        return str(event.get_sender_id()) in self.admin_ids
+
+    def _can_point_song(self, event: AstrMessageEvent) -> bool:
+        """是否允许点歌：管理员或白名单；白名单为空则不限制。"""
+        if self._is_admin(event):
+            return True
+        if not self.point_allowlist:
+            return True
+        return str(event.get_sender_id()) in self.point_allowlist
 
     # ---------- 工具 ----------
 
@@ -68,6 +101,8 @@ class NcmDailyPlugin(Star):
         Args:
             count(int): 返回数量，默认 10，最大 20
         """
+        if not self._is_admin(event):
+            return "该工具仅管理员可用（插件配置 admin_user_ids）。"
         if not self.ncm.logged_in:
             return COOKIE_TIP
         count = max(1, min(int(count), 20))
@@ -86,6 +121,8 @@ class NcmDailyPlugin(Star):
         Returns:
             歌单列表文本；未配置 Cookie 时返回配置提示。
         """
+        if not self._is_admin(event):
+            return "该工具仅管理员可用（插件配置 admin_user_ids）。"
         if not self.ncm.logged_in:
             return COOKIE_TIP
         try:
@@ -109,6 +146,8 @@ class NcmDailyPlugin(Star):
         Args:
             playlist_id(int): 网易云歌单 ID
         """
+        if not self._is_admin(event):
+            return "该工具仅管理员可用（插件配置 admin_user_ids）。"
         try:
             playlist = self.ncm.get_playlist_detail(playlist_id, limit=30)
         except NCMError as e:
@@ -173,9 +212,22 @@ class NcmDailyPlugin(Star):
         if not event.is_at_or_wake_command:
             return
         text = event.message_str.strip()
+
+        # 点歌指令（白名单）：点歌 [歌手 - ]歌名
+        if text.startswith(POINT_CMD):
+            await self._point_song(event, key, text[len(POINT_CMD):].strip())
+            return
+
         if text not in ("我的歌单", "歌单", "查看歌单"):
             return
         event.stop_event()
+
+        # 仅管理员可用
+        if not self._is_admin(event):
+            await event.send(
+                event.plain_result("该功能仅管理员可用（请在插件配置 admin_user_ids 中填写你的 QQ）。")
+            )
+            return
 
         if not self.ncm.logged_in:
             yield event.plain_result(COOKIE_TIP)
@@ -199,10 +251,60 @@ class NcmDailyPlugin(Star):
         logger.debug(f"[ncm] 已注册等待状态: {key}")
 
         items = [f"{i}. {pl.get('name')}（{pl.get('trackCount')} 首）" for i, pl in enumerate(playlists, 1)]
-        await self._send_forward_list(
+        await self._send_text_list(
             event,
             "🎵 你的歌单（回复序号选择，仅你本人可操作）：",
             items,
+        )
+
+    async def _point_song(self, event: AstrMessageEvent, key: str, query: str) -> None:
+        """点歌指令：搜索歌曲并列出（回复序号播放）。"""
+        if not query:
+            await event.send(event.plain_result("用法：点歌 歌手 - 歌名 或 点歌 歌名"))
+            return
+        if not self._can_point_song(event):
+            await event.send(
+                event.plain_result("你没有点歌权限（需加入插件配置 point_song_allowlist 白名单）。")
+            )
+            return
+        event.stop_event()
+
+        # 解析歌手与歌名：优先 "歌手 - 歌名"（支持 - 无空格）
+        artist, name = "", query
+        for sep in (" - ", "-"):
+            if sep in query:
+                parts = query.split(sep, 1)
+                artist, name = parts[0].strip(), parts[1].strip()
+                break
+        keyword = f"{artist} {name}".strip() if artist else name
+        if not keyword:
+            await event.send(event.plain_result("歌名不能为空"))
+            return
+
+        try:
+            songs = self.ncm.search_songs(keyword, POINT_LIMIT)
+        except NCMError as e:
+            await event.send(event.plain_result(f"搜索失败：{e}"))
+            return
+        if not songs:
+            await event.send(event.plain_result(f"没有找到「{keyword}」相关的歌曲"))
+            return
+
+        # 注册等待状态（点歌模式：playlists 为空，tracks=搜索结果）
+        self._waiting[key] = {
+            "playlists": [],
+            "tracks": songs,
+            "offset": 0,
+            "expiry": time.time() + WAIT_TIMEOUT,
+        }
+        logger.debug(f"[ncm] 点歌已注册等待状态: {key}")
+
+        items = [self._format_song(i, s) for i, s in enumerate(songs, 1)]
+        await self._send_text_list(
+            event,
+            f"🎵 「{keyword}」的搜索结果：",
+            items,
+            hint="回复序号播放，或直接回复歌名重新搜索",
         )
 
     async def _handle_input(self, event: AstrMessageEvent, key: str, state: dict) -> None:
@@ -276,38 +378,36 @@ class NcmDailyPlugin(Star):
 
     # ---------- 交互辅助 ----------
 
-    async def _send_forward_list(
+    async def _send_text_list(
         self,
         event: AstrMessageEvent,
         title: str,
         items: list[str],
         hint: str = "",
-    ) -> bool:
-        """以合并转发（聊天记录卡片）形式发送列表：标题为第一条 node，每行一条 node。
-
-        仅 aiocqhttp（NapCat/OneBot v11）平台支持；发送失败自动降级为一条普通文本消息。
-        返回 True 表示以合并转发形式发出，False 表示降级为普通消息。
-        """
-        try:
-            self_id = str(getattr(event, "get_self_id", lambda: "0")() or "0")
-        except Exception:
-            self_id = "0"
-        nickname = "网易云音乐助手"
-        nodes = [Node(content=[Plain(title)], name=nickname, uin=self_id)]
-        for line in items:
-            nodes.append(Node(content=[Plain(line)], name=nickname, uin=self_id))
+    ) -> None:
+        """把列表作为一条普通文本消息发出；超过 MSG_LIMIT 字符时截断并提示翻页。"""
+        text = title + "\n" + "\n".join(items)
+        truncated = False
+        if len(text) > MSG_LIMIT:
+            parts = [title]
+            cur = len(title)
+            shown = 0
+            for line in items:
+                if cur + len(line) + 1 > MSG_LIMIT:
+                    truncated = True
+                    break
+                parts.append(line)
+                cur += len(line) + 1
+                shown += 1
+            text = "\n".join(parts)
+            if truncated:
+                hint = (
+                    (hint + "；" if hint else "")
+                    + f"列表较长，已展示前 {shown} 项，输入「更多」查看后续"
+                )
         if hint:
-            nodes.append(Node(content=[Plain(hint)], name=nickname, uin=self_id))
-        try:
-            await event.send(MessageChain([Nodes(nodes)]))
-            return True
-        except Exception as e:
-            logger.warning(f"[ncm] 合并转发发送失败，降级为普通消息: {e}")
-            text = title + "\n" + "\n".join(items)
-            if hint:
-                text += "\n" + hint
-            await event.send(event.plain_result(text))
-            return False
+            text += "\n" + hint
+        await event.send(event.plain_result(text))
 
     async def _send_song_list(
         self,
@@ -316,7 +416,7 @@ class NcmDailyPlugin(Star):
         tracks: list[dict],
         offset: int,
     ) -> None:
-        """把歌单歌曲列表作为合并转发（聊天记录卡片）发出（从 1 开始编号）。"""
+        """把歌单歌曲列表作为一条普通文本消息发出（从 1 开始编号，每页最多 PAGE_SIZE 首）。"""
         start = offset + 1
         end = min(offset + PAGE_SIZE, len(tracks))
         if end < start:
@@ -332,7 +432,7 @@ class NcmDailyPlugin(Star):
                 a.get("name", "") for a in (s.get("artists") or [])
             )
             items.append(f"{i}. {s.get('name')} - {artists}")
-        await self._send_forward_list(
+        await self._send_text_list(
             event,
             title,
             items,
