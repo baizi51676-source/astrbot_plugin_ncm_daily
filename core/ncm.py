@@ -137,13 +137,16 @@ class NetEaseMusic:
         if not playlist:
             return None
         tracks = (playlist.get("tracks") or [])[:limit]
-        # 老接口返回的 track 可能是精简结构（只有 id/name），
-        # 若缺少歌手/专辑/时长信息则批量补齐
-        if tracks and not tracks[0].get("artists"):
-            detail_map = {
-                s.get("id"): s
-                for s in self.get_song_details([t.get("id") for t in tracks if t.get("id")])
-            }
+        # 老接口返回的 track 可能是精简结构（只有 id/name，无 artists），且可能
+        # 只有部分 track 缺失（如前半有歌手、后半无）——不能只看第一首，只要
+        # 有任何一首缺歌手就批量补齐（超大歌单按 500 首一批，避免接口限制）
+        missing = [t for t in tracks if t.get("id") and not t.get("artists")]
+        if missing:
+            detail_map: dict[int, dict] = {}
+            ids = [t["id"] for t in missing]
+            for i in range(0, len(ids), 500):
+                for s in self.get_song_details(ids[i : i + 500]):
+                    detail_map[s.get("id")] = s
             tracks = [detail_map.get(t.get("id"), t) for t in tracks]
         playlist["tracks"] = tracks
         return playlist
