@@ -129,7 +129,10 @@ class NetEaseMusic:
         Returns:
             歌单 dict（含 name/trackCount/tracks）或 None。
         """
-        d = self._request(f"{API_BASE}/api/v1/playlist/detail", {"id": playlist_id})
+        d = self._request(
+            f"{API_BASE}/api/v1/playlist/detail",
+            {"id": playlist_id, "n": 100000},  # n 控制返回曲目数，不传则默认仅 10 首
+        )
         playlist = d.get("playlist")
         if not playlist:
             return None
