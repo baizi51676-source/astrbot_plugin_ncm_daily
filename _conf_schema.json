@@ -14,8 +14,8 @@
   "point_song_allowlist": {
     "description": "点歌白名单 QQ 列表",
     "hint": "填写 QQ 号（字符串数组），如 [\"10001\"]。留空表示不限制（所有人都可以点歌）；管理员始终可以点歌。",
-    "type": "array",
-    "item_type": "string",
+    "type": "list",
+    "items": {"type": "string"},
     "default": []
   }
 }
