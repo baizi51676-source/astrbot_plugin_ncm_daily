@@ -5,12 +5,11 @@
     "type": "string",
     "default": ""
   },
-  "admin_user_ids": {
-    "description": "管理员 QQ 列表（我的歌单、歌单详情、每日推荐仅管理员可用）",
-    "hint": "填写 QQ 号（字符串数组），如 [\"10001\", \"10002\"]。不填则无人可查看歌单/日推（搜索和点歌不受影响）。",
-    "type": "array",
-    "item_type": "string",
-    "default": []
+  "admin_only": {
+    "description": "仅管理员使用歌单/日推（默认开启）",
+    "hint": "开启后「我的歌单」、歌单详情、每日推荐仅管理员可用（管理员 = AstrBot 配置页 admins_id 列表 / 群主 / 群管理员）；关闭后所有人可用。⚠️ 不建议关闭，可能泄露你的歌单与听歌偏好隐私。",
+    "type": "bool",
+    "default": true
   },
   "point_song_allowlist": {
     "description": "点歌白名单 QQ 列表",

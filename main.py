@@ -42,12 +42,8 @@ class NcmDailyPlugin(Star):
         """等待交互状态：key = "{origin}:{sender}"，仅发起者本人可操作。
         字段：playlists / tracks / offset / expiry
         """
-        # 管理员 QQ 列表（我的歌单/歌单详情/日推 仅管理员可用；aiocqhttp 平台
-        # event.is_admin() 恒为 False，故用配置列表兜底）
-        raw_admin = config.get("admin_user_ids", []) or []
-        self.admin_ids = {
-            str(x).strip() for x in raw_admin if str(x).strip()
-        }
+        # 仅管理员开关（默认开启）：关闭后我的歌单/歌单详情/日推对所有人开放
+        self.admin_only = bool(config.get("admin_only", True))
         # 点歌白名单 QQ 列表；为空 = 不限制；管理员始终可点歌
         raw_allow = config.get("point_song_allowlist", []) or []
         self.point_allowlist = {
@@ -57,13 +53,46 @@ class NcmDailyPlugin(Star):
     # ---------- 权限 ----------
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
-        """是否管理员：event.is_admin()（部分平台有效）或配置的 admin_user_ids。"""
+        """是否管理员：使用 AstrBot 自带机制（不额外维护列表）。
+
+        优先级：
+        1. event.is_admin()（discord/kook 等平台有效）
+        2. OneBot 群角色 owner/admin（群主/群管理员，从原始事件取）
+        3. AstrBot 全局配置 admins_id（WebUI 配置页面设置）
+        """
         try:
             if event.is_admin():
                 return True
         except Exception:
             pass
-        return str(event.get_sender_id()) in self.admin_ids
+        try:
+            raw = getattr(event, "message_obj", None)
+            raw = getattr(raw, "raw_message", None)
+            if raw is not None and hasattr(raw, "get"):
+                role = (raw.get("sender") or {}).get("role", "")
+                if role in ("owner", "admin"):
+                    return True
+        except Exception:
+            pass
+        try:
+            conf = self.context.get_conf(event.unified_msg_origin)
+            admins = (conf or {}).get("admins_id", []) or []
+            return str(event.get_sender_id()) in {str(a).strip() for a in admins}
+        except Exception:
+            try:
+                conf = self.context.get_conf(None)
+                admins = (conf or {}).get("admins_id", []) or []
+                return str(event.get_sender_id()) in {str(a).strip() for a in admins}
+            except Exception:
+                pass
+        return False
+
+    def _admin_tip(self) -> str:
+        """非管理员时的提示文案。"""
+        return (
+            "该功能仅管理员可用。请在 AstrBot 配置页面（WebUI → 配置 → "
+            "admins_id 管理员列表）中添加你的 QQ 后重试。"
+        )
 
     def _can_point_song(self, event: AstrMessageEvent) -> bool:
         """是否允许点歌：管理员或白名单；白名单为空则不限制。"""
@@ -101,8 +130,8 @@ class NcmDailyPlugin(Star):
         Args:
             count(int): 返回数量，默认 10，最大 20
         """
-        if not self._is_admin(event):
-            return "该工具仅管理员可用（插件配置 admin_user_ids）。"
+        if self.admin_only and not self._is_admin(event):
+            return self._admin_tip()
         if not self.ncm.logged_in:
             return COOKIE_TIP
         count = max(1, min(int(count), 20))
@@ -121,8 +150,8 @@ class NcmDailyPlugin(Star):
         Returns:
             歌单列表文本；未配置 Cookie 时返回配置提示。
         """
-        if not self._is_admin(event):
-            return "该工具仅管理员可用（插件配置 admin_user_ids）。"
+        if self.admin_only and not self._is_admin(event):
+            return self._admin_tip()
         if not self.ncm.logged_in:
             return COOKIE_TIP
         try:
@@ -146,8 +175,8 @@ class NcmDailyPlugin(Star):
         Args:
             playlist_id(int): 网易云歌单 ID
         """
-        if not self._is_admin(event):
-            return "该工具仅管理员可用（插件配置 admin_user_ids）。"
+        if self.admin_only and not self._is_admin(event):
+            return self._admin_tip()
         try:
             playlist = self.ncm.get_playlist_detail(playlist_id, limit=30)
         except NCMError as e:
@@ -222,11 +251,9 @@ class NcmDailyPlugin(Star):
             return
         event.stop_event()
 
-        # 仅管理员可用
-        if not self._is_admin(event):
-            await event.send(
-                event.plain_result("该功能仅管理员可用（请在插件配置 admin_user_ids 中填写你的 QQ）。")
-            )
+        # 仅管理员可用（默认开启，可配置 admin_only 关闭）
+        if self.admin_only and not self._is_admin(event):
+            await event.send(event.plain_result(self._admin_tip()))
             return
 
         if not self.ncm.logged_in:
