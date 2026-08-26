@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
@@ -155,6 +156,7 @@ class NcmDailyPlugin(Star):
         """命令入口 + 交互输入处理（不依赖 AstrBot session_waiter）"""
         key = self._session_key(event)
         state = self._waiting.get(key)
+        logger.debug(f"[ncm] key={key} state={'有' if state else '无'} text={event.message_str.strip()!r}")
 
         # ---- 交互输入：等待状态中的消息直接处理并拦截 ----
         if state is not None:
@@ -186,17 +188,19 @@ class NcmDailyPlugin(Star):
             yield event.plain_result("没有获取到歌单，可能是 Cookie 已失效")
             return
 
-        lines = ["🎵 你的歌单（回复序号选择，仅你本人可操作）："]
-        for i, pl in enumerate(playlists, 1):
-            lines.append(f"{i}. {pl.get('name')}（{pl.get('trackCount')} 首）")
-        yield event.plain_result("\n".join(lines))
-
+        # 先注册等待状态，再发送列表（不依赖 yield 之后代码执行）
         self._waiting[key] = {
             "playlists": playlists,
             "tracks": [],
             "offset": 0,
             "expiry": time.time() + WAIT_TIMEOUT,
         }
+        logger.debug(f"[ncm] 已注册等待状态: {key}")
+
+        lines = ["🎵 你的歌单（回复序号选择，仅你本人可操作）："]
+        for i, pl in enumerate(playlists, 1):
+            lines.append(f"{i}. {pl.get('name')}（{pl.get('trackCount')} 首）")
+        yield event.plain_result("\n".join(lines))
 
     async def _handle_input(self, event: AstrMessageEvent, key: str, state: dict) -> None:
         """处理等待中的用户输入：选歌单 / 选歌 / 翻页 / 歌名搜索。"""
