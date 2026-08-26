@@ -12,6 +12,11 @@ from __future__ import annotations
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.core.utils.session_waiter import (
+    SessionController,
+    SessionFilter,
+    session_waiter,
+)
 
 from .core.ncm import NCMError, NetEaseMusic
 from .core.sender import MusicCardSender
@@ -20,6 +25,18 @@ COOKIE_TIP = (
     "未配置 MUSIC_U Cookie。请在插件配置中填入网易云 MUSIC_U Cookie"
     "（浏览器登录 music.163.com 后按 F12 → 网络 → 复制任意请求 Cookie 里的 MUSIC_U 值）。"
 )
+
+PAGE_SIZE = 30  # 歌单歌曲列表每页数量
+
+
+class _UserSessionFilter(SessionFilter):
+    """会话隔离：群/会话 + 发送者。
+
+    只有发起命令的本人回复才会进入选择流程，同群其他人回复无效。
+    """
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        return f"{event.unified_msg_origin}:{event.get_sender_id()}"
 
 
 class NcmDailyPlugin(Star):
@@ -129,6 +146,164 @@ class NcmDailyPlugin(Star):
             return f"已发送音乐卡片《{name}》"
         link = self.sender.song_link(song_id)
         return f"当前平台不支持音乐卡片，可点击链接试听：{link}"
+
+    # ---------- 命令交互（我的歌单） ----------
+
+    @filter.command("我的歌单", alias={"歌单", "查看歌单"})
+    async def my_playlists_cmd(self, event: AstrMessageEvent):
+        """我的歌单、歌单、查看歌单：列出歌单，回复序号选择，再回复序号或歌名播放（仅本人可操作）"""
+        pass
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_my_playlists(self, event: AstrMessageEvent):
+        """命令入口：我的歌单 / 歌单 / 查看歌单"""
+        if not event.is_at_or_wake_command:
+            return
+        text = event.message_str.strip()
+        if text not in ("我的歌单", "歌单", "查看歌单"):
+            return
+        event.stop_event()
+
+        if not self.ncm.logged_in:
+            yield event.plain_result(COOKIE_TIP)
+            return
+        try:
+            playlists = self.ncm.get_user_playlists(limit=30)
+        except NCMError as e:
+            yield event.plain_result(f"获取歌单失败：{e}")
+            return
+        if not playlists:
+            yield event.plain_result("没有获取到歌单，可能是 Cookie 已失效")
+            return
+
+        lines = ["🎵 你的歌单（回复序号选择，仅你本人可操作）："]
+        for i, pl in enumerate(playlists, 1):
+            lines.append(f"{i}. {pl.get('name')}（{pl.get('trackCount')} 首）")
+        yield event.plain_result("\n".join(lines))
+
+        # 交互状态：selected_tracks 为空 = 等待选歌单；否则 = 等待选歌
+        selected_tracks: list[dict] = []
+        offset = 0
+
+        @session_waiter(timeout=120)
+        async def waiter(controller: SessionController, ev: AstrMessageEvent):
+            nonlocal selected_tracks, offset
+            text = ev.message_str.strip()
+
+            if not selected_tracks:
+                # ---- 阶段1：选择歌单 ----
+                if not text.isdigit():
+                    return
+                idx = int(text)
+                if idx < 1 or idx > len(playlists):
+                    await ev.send(
+                        ev.plain_result(f"序号超出范围（1-{len(playlists)}），请重新输入")
+                    )
+                    return
+                pl = playlists[idx - 1]
+                try:
+                    detail = self.ncm.get_playlist_detail(pl.get("id"), limit=100000)
+                except NCMError as e:
+                    await ev.send(ev.plain_result(f"获取歌单失败：{e}"))
+                    controller.stop()
+                    return
+                if not detail:
+                    await ev.send(ev.plain_result("歌单不存在"))
+                    controller.stop()
+                    return
+                selected_tracks = detail.get("tracks") or []
+                offset = 0
+                await self._send_song_list(ev, detail, selected_tracks, offset)
+                controller.keep(120, reset_timeout=True)
+                return
+
+            # ---- 阶段2：选择歌曲 ----
+            low = text.lower()
+            if low in ("更多", "下一页", "下页"):
+                if offset + PAGE_SIZE >= len(selected_tracks):
+                    await ev.send(ev.plain_result("已经是最后一页了"))
+                else:
+                    offset += PAGE_SIZE
+                    await self._send_song_list(ev, None, selected_tracks, offset)
+                controller.keep(120, reset_timeout=True)
+                return
+
+            if text.isdigit():
+                idx = int(text)
+                if idx < 1 or idx > len(selected_tracks):
+                    await ev.send(
+                        ev.plain_result(
+                            f"序号超出范围（1-{len(selected_tracks)}），请重新输入"
+                        )
+                    )
+                    return
+                await self._send_and_stop(controller, ev, selected_tracks[idx - 1])
+                return
+
+            # 按歌名搜索并播放
+            try:
+                songs = self.ncm.search_songs(text, 1)
+            except NCMError as e:
+                await ev.send(ev.plain_result(f"搜索失败：{e}"))
+                return
+            if not songs:
+                await ev.send(ev.plain_result(f"没有找到「{text}」相关的歌曲"))
+                return
+            await self._send_and_stop(controller, ev, songs[0])
+
+        try:
+            await waiter(event, session_filter=_UserSessionFilter())
+        except TimeoutError:
+            yield event.plain_result("选择超时，已退出")
+
+    # ---------- 交互辅助 ----------
+
+    async def _send_song_list(
+        self,
+        event: AstrMessageEvent,
+        detail: dict | None,
+        tracks: list[dict],
+        offset: int,
+    ) -> None:
+        """把歌单歌曲列表作为一条消息发出（从 1 开始编号）。"""
+        start = offset + 1
+        end = min(offset + PAGE_SIZE, len(tracks))
+        if end < start:
+            end = start
+        lines = []
+        if detail:
+            total = detail.get("trackCount", "?")
+            lines.append(
+                f"🎵 歌单「{detail.get('name')}」共 {total} 首，展示第 {start}-{end} 首："
+            )
+        else:
+            lines.append(f"🎵 继续展示第 {start}-{end} 首：")
+        for i, s in enumerate(tracks[offset:end], start):
+            artists = "、".join(
+                a.get("name", "") for a in (s.get("artists") or [])
+            )
+            lines.append(f"{i}. {s.get('name')} - {artists}")
+        lines.append("回复序号播放，或直接回复歌名搜索；输入「更多」查看下一页")
+        await event.send(event.plain_result("\n".join(lines)))
+
+    async def _send_and_stop(
+        self,
+        controller: SessionController,
+        event: AstrMessageEvent,
+        song: dict,
+    ) -> None:
+        """发送歌曲（卡片或链接）并结束会话。"""
+        name = song.get("name", "未知歌曲")
+        ok = await self.sender.send_music_card(event, song.get("id"))
+        if ok:
+            await event.send(event.plain_result(f"已发送《{name}》音乐卡片"))
+        else:
+            await event.send(
+                event.plain_result(
+                    f"当前平台不支持音乐卡片，可点击试听：{self.sender.song_link(song.get('id'))}"
+                )
+            )
+        controller.stop()
 
     # ---------- 格式化 ----------
 
