@@ -144,8 +144,9 @@ class NetEaseMusic:
         if missing:
             detail_map: dict[int, dict] = {}
             ids = [t["id"] for t in missing]
-            for i in range(0, len(ids), 500):
-                for s in self.get_song_details(ids[i : i + 500]):
+            # song/detail 批量接口一次最多返回约 200 首，按 100 首一批更安全
+            for i in range(0, len(ids), 100):
+                for s in self.get_song_details(ids[i : i + 100]):
                     detail_map[s.get("id")] = s
             tracks = [detail_map.get(t.get("id"), t) for t in tracks]
         playlist["tracks"] = tracks
