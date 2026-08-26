@@ -12,7 +12,8 @@ from __future__ import annotations
 import time
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Node, Nodes, Plain
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
@@ -197,10 +198,12 @@ class NcmDailyPlugin(Star):
         }
         logger.debug(f"[ncm] 已注册等待状态: {key}")
 
-        lines = ["🎵 你的歌单（回复序号选择，仅你本人可操作）："]
-        for i, pl in enumerate(playlists, 1):
-            lines.append(f"{i}. {pl.get('name')}（{pl.get('trackCount')} 首）")
-        yield event.plain_result("\n".join(lines))
+        items = [f"{i}. {pl.get('name')}（{pl.get('trackCount')} 首）" for i, pl in enumerate(playlists, 1)]
+        await self._send_forward_list(
+            event,
+            "🎵 你的歌单（回复序号选择，仅你本人可操作）：",
+            items,
+        )
 
     async def _handle_input(self, event: AstrMessageEvent, key: str, state: dict) -> None:
         """处理等待中的用户输入：选歌单 / 选歌 / 翻页 / 歌名搜索。"""
@@ -273,6 +276,39 @@ class NcmDailyPlugin(Star):
 
     # ---------- 交互辅助 ----------
 
+    async def _send_forward_list(
+        self,
+        event: AstrMessageEvent,
+        title: str,
+        items: list[str],
+        hint: str = "",
+    ) -> bool:
+        """以合并转发（聊天记录卡片）形式发送列表：标题为第一条 node，每行一条 node。
+
+        仅 aiocqhttp（NapCat/OneBot v11）平台支持；发送失败自动降级为一条普通文本消息。
+        返回 True 表示以合并转发形式发出，False 表示降级为普通消息。
+        """
+        try:
+            self_id = str(getattr(event, "get_self_id", lambda: "0")() or "0")
+        except Exception:
+            self_id = "0"
+        nickname = "网易云音乐助手"
+        nodes = [Node(content=[Plain(title)], name=nickname, uin=self_id)]
+        for line in items:
+            nodes.append(Node(content=[Plain(line)], name=nickname, uin=self_id))
+        if hint:
+            nodes.append(Node(content=[Plain(hint)], name=nickname, uin=self_id))
+        try:
+            await event.send(MessageChain([Nodes(nodes)]))
+            return True
+        except Exception as e:
+            logger.warning(f"[ncm] 合并转发发送失败，降级为普通消息: {e}")
+            text = title + "\n" + "\n".join(items)
+            if hint:
+                text += "\n" + hint
+            await event.send(event.plain_result(text))
+            return False
+
     async def _send_song_list(
         self,
         event: AstrMessageEvent,
@@ -280,26 +316,28 @@ class NcmDailyPlugin(Star):
         tracks: list[dict],
         offset: int,
     ) -> None:
-        """把歌单歌曲列表作为一条消息发出（从 1 开始编号）。"""
+        """把歌单歌曲列表作为合并转发（聊天记录卡片）发出（从 1 开始编号）。"""
         start = offset + 1
         end = min(offset + PAGE_SIZE, len(tracks))
         if end < start:
             end = start
-        lines = []
         if detail:
             total = detail.get("trackCount", "?")
-            lines.append(
-                f"🎵 歌单「{detail.get('name')}」共 {total} 首，展示第 {start}-{end} 首："
-            )
+            title = f"🎵 歌单「{detail.get('name')}」共 {total} 首，展示第 {start}-{end} 首："
         else:
-            lines.append(f"🎵 继续展示第 {start}-{end} 首：")
+            title = f"🎵 继续展示第 {start}-{end} 首："
+        items = []
         for i, s in enumerate(tracks[offset:end], start):
             artists = "、".join(
                 a.get("name", "") for a in (s.get("artists") or [])
             )
-            lines.append(f"{i}. {s.get('name')} - {artists}")
-        lines.append("回复序号播放，或直接回复歌名搜索；输入「更多」查看下一页")
-        await event.send(event.plain_result("\n".join(lines)))
+            items.append(f"{i}. {s.get('name')} - {artists}")
+        await self._send_forward_list(
+            event,
+            title,
+            items,
+            hint="回复序号播放，或直接回复歌名搜索；输入「更多」查看下一页",
+        )
 
     async def _send_and_stop(
         self,
