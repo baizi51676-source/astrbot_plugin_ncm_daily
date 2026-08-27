@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-API_BASE = "http://music.163.com"
+API_BASE = "https://music.163.com"
 
 HEADERS = {
     "User-Agent": (
