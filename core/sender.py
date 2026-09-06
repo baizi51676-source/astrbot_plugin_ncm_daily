@@ -49,3 +49,26 @@ class MusicCardSender:
         except Exception as e:
             logger.error(f"音乐卡片发送失败: {e}")
             return False
+
+    @staticmethod
+    async def recall_message(event: AstrMessageEvent, message_id: object) -> bool:
+        """撤回一条由本插件发送的消息（点歌/选择列表页）。
+
+        仅 aiocqhttp（NapCat/OneBot v11）平台支持；非该平台、消息不存在、
+        超时或无权限等情况一律静默失败并返回 False，不影响主流程。
+
+        Returns:
+            True 表示撤回成功或无需撤回（message_id 为空也视为成功）。
+        """
+        if message_id is None:
+            return True
+        if AiocqhttpMessageEvent is None or not isinstance(
+            event, AiocqhttpMessageEvent
+        ):
+            return False
+        try:
+            await event.bot.api.call_action("delete_msg", message_id=int(message_id))
+            return True
+        except Exception as e:
+            logger.warning(f"撤回消息失败（忽略）: {e}")
+            return False

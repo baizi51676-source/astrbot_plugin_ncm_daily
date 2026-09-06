@@ -21,6 +21,13 @@ from astrbot.core.config.astrbot_config import AstrBotConfig
 
 from .core.ncm import NCMError, NetEaseMusic
 from .core.sender import MusicCardSender
+try:  # AstrBot v4 内部 API：aiocqhttp（NapCat/OneBot v11）平台事件
+    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+        AiocqhttpMessageEvent,
+    )
+except Exception:  # pragma: no cover - 平台不可用时降级
+    AiocqhttpMessageEvent = None  # type: ignore[assignment,misc]
+
 
 COOKIE_TIP = (
     "未配置 MUSIC_U Cookie。请在插件配置中填入网易云 MUSIC_U Cookie"
@@ -83,6 +90,8 @@ class NcmDailyPlugin(Star):
             # 状态仍是同一个（未被用户操作清理）才提示
             if self._waiting.get(key) is state:
                 self._waiting.pop(key, None)
+                # 顺带撤回等待期间残留的选择列表（仅 aiocqhttp 平台有效，失败静默）
+                await self.sender.recall_message(event, state.get("select_msg_id"))
                 mode = state.get("mode", "")
                 tip = {
                     "point": "点歌超时",
@@ -244,17 +253,19 @@ class NcmDailyPlugin(Star):
     ):
         """向当前会话发送网易云音乐卡片（QQ 群内可直接点击播放）。
 
+        成功时不返回提示文本（卡片本身即反馈）；失败时返回可试听链接。
+
         Args:
             song_id(int): 网易云歌曲 ID（来自搜索/日推/歌单结果）
-            song_name(string): 歌曲名称，用于发送失败时的提示（可选）
+            song_name(string): 歌曲名称（保留兼容，不再用于提示）
         """
         # 白名单控制（管理员/白名单用户；白名单为空=不限制）
         if not self._can_point_song(event):
             return "你没有使用音乐功能的权限（需加入插件配置 point_song_allowlist 白名单）。"
-        name = song_name or f"id={song_id}"
+        # 成功不返回提示文本：卡片本身即反馈，避免“已发送《…》音乐卡片”冗余播报
         ok = await self.sender.send_music_card(event, song_id)
         if ok:
-            return f"已发送音乐卡片《{name}》"
+            return ""
         link = self.sender.song_link(song_id)
         return f"当前平台不支持音乐卡片，可点击链接试听：{link}"
 
@@ -335,9 +346,9 @@ class NcmDailyPlugin(Star):
         self._start_timeout_task(key, state, event)
 
         items = [f"{i}. {pl.get('name')}（{pl.get('trackCount')} 首）" for i, pl in enumerate(playlists, 1)]
-        await self._send_text_list(
+        state["select_msg_id"] = await self._send_text_list(
             event,
-            "🎵 你的歌单（回复序号选择，仅你本人可操作）：",
+            "你的歌单（回复序号选择，仅你本人可操作）：",
             items,
         )
 
@@ -387,9 +398,9 @@ class NcmDailyPlugin(Star):
         self._start_timeout_task(key, state, event)
 
         items = [self._format_song(i, s) for i, s in enumerate(songs, 1)]
-        await self._send_text_list(
+        state["select_msg_id"] = await self._send_text_list(
             event,
-            f"🎵 「{keyword}」的搜索结果：",
+            f"「{keyword}」的搜索结果：",
             items,
             hint="回复序号播放，或直接回复歌名重新搜索",
         )
@@ -427,9 +438,9 @@ class NcmDailyPlugin(Star):
         self._start_timeout_task(key, state, event)
 
         items = [self._format_song(i, s) for i, s in enumerate(songs, 1)]
-        await self._send_text_list(
+        state["select_msg_id"] = await self._send_text_list(
             event,
-            "🎵 今日推荐（回复序号播放，仅你本人可操作）：",
+            "今日推荐（回复序号播放，仅你本人可操作）：",
             items,
             hint="回复序号播放，或直接回复歌名搜索",
         )
@@ -464,7 +475,7 @@ class NcmDailyPlugin(Star):
             state["tracks"] = detail.get("tracks") or []
             state["offset"] = 0
             state["expiry"] = time.time() + WAIT_TIMEOUT
-            await self._send_song_list(event, detail, state["tracks"], 0)
+            await self._send_song_list(event, detail, state["tracks"], 0, state)
             return
 
         # ---- 阶段2：选择歌曲 ----
@@ -476,7 +487,7 @@ class NcmDailyPlugin(Star):
                 state["offset"] += PAGE_SIZE
                 state["expiry"] = time.time() + WAIT_TIMEOUT
                 await self._send_song_list(
-                    event, None, state["tracks"], state["offset"]
+                    event, None, state["tracks"], state["offset"], state
                 )
             return
 
@@ -511,12 +522,16 @@ class NcmDailyPlugin(Star):
         title: str,
         items: list[str],
         hint: str = "",
-    ) -> None:
+    ) -> int | None:
         """以合并转发（聊天记录卡片）形式发送列表：卡片内仅一条消息（完整多行文本）。
 
         聊天界面只显示一个卡片，不占屏、不被 QQ 折叠拆分；点开后就是完整的
         多行文本（类似直接回复文本的效果）。超过 MSG_LIMIT 字符时截断并提示翻页。
         发送失败（非 aiocqhttp 平台等）自动降级为普通文本消息。
+
+        Returns:
+            aiocqhttp 平台下返回该列表消息的 message_id（供点歌/选择完成后撤回）；
+            其他平台或降级发送时返回 None。
         """
         text = title + "\n" + "\n".join(items)
         truncated = False
@@ -539,12 +554,45 @@ class NcmDailyPlugin(Star):
                 )
         if hint:
             text += "\n" + hint
-
         try:
             self_id = str(getattr(event, "get_self_id", lambda: "0")() or "0")
         except Exception:
             self_id = "0"
-        # 合并转发卡片：仅一条 node，内容为完整多行文本
+
+        # aiocqhttp（NapCat/OneBot v11）：直接以 node（转发）形式走底层 API 发送，
+        # 换取 message_id，供选歌完成/交互超时后撤回该列表消息（与 core/sender.py 同一套调用）。
+        if AiocqhttpMessageEvent is not None and isinstance(
+            event, AiocqhttpMessageEvent
+        ):
+            payloads: dict = {
+                "message": [
+                    {
+                        "type": "node",
+                        "data": {
+                            "uin": self_id,
+                            "name": "网易云音乐助手",
+                            "content": [{"type": "text", "data": {"text": text}}],
+                        },
+                    }
+                ]
+            }
+            try:
+                if event.is_private_chat():
+                    payloads["user_id"] = event.get_sender_id()
+                    result = await event.bot.api.call_action(
+                        "send_private_msg", **payloads
+                    )
+                else:
+                    payloads["group_id"] = event.get_group_id()
+                    result = await event.bot.api.call_action(
+                        "send_group_msg", **payloads
+                    )
+                mid = (result or {}).get("message_id")
+                return int(mid) if mid is not None else None
+            except Exception as e:
+                logger.warning(f"[ncm] 合并转发发送失败，降级为普通消息: {e}")
+
+        # 降级发送：普通合并转发卡片；仍失败则再降级为纯文本
         try:
             node = Node(
                 content=[Plain(text)],
@@ -552,10 +600,10 @@ class NcmDailyPlugin(Star):
                 uin=self_id,
             )
             await event.send(MessageChain([Nodes([node])]))
-            return
         except Exception as e:
             logger.warning(f"[ncm] 合并转发发送失败，降级为普通消息: {e}")
-        await event.send(event.plain_result(text))
+            await event.send(event.plain_result(text))
+        return None
 
     async def _send_song_list(
         self,
@@ -563,29 +611,40 @@ class NcmDailyPlugin(Star):
         detail: dict | None,
         tracks: list[dict],
         offset: int,
-    ) -> None:
-        """把歌单歌曲列表作为一条普通文本消息发出（从 1 开始编号，每页最多 PAGE_SIZE 首）。"""
+        state: dict | None = None,
+    ) -> int | None:
+        """把歌单歌曲列表作为合并转发卡片发出（从 1 开始编号，每页最多 PAGE_SIZE 首）。
+
+        Args:
+            state: 交互等待状态；传入时把新列表的 message_id 写入 state["select_msg_id"]。
+
+        Returns:
+            同 _send_text_list：aiocqhttp 平台返回 message_id，否则 None。
+        """
         start = offset + 1
         end = min(offset + PAGE_SIZE, len(tracks))
         if end < start:
             end = start
         if detail:
             total = detail.get("trackCount", "?")
-            title = f"🎵 歌单「{detail.get('name')}」共 {total} 首，展示第 {start}-{end} 首："
+            title = f"歌单「{detail.get('name')}」共 {total} 首，展示第 {start}-{end} 首："
         else:
-            title = f"🎵 继续展示第 {start}-{end} 首："
+            title = f"继续展示第 {start}-{end} 首："
         items = []
         for i, s in enumerate(tracks[offset:end], start):
             artists = "、".join(
                 a.get("name", "") for a in (s.get("artists") or [])
             )
             items.append(f"{i}. {s.get('name')} - {artists}")
-        await self._send_text_list(
+        mid = await self._send_text_list(
             event,
             title,
             items,
             hint="回复序号播放，或直接回复歌名搜索；输入「更多」查看下一页",
         )
+        if state is not None:
+            state["select_msg_id"] = mid
+        return mid
 
     async def _send_and_stop(
         self,
@@ -593,11 +652,16 @@ class NcmDailyPlugin(Star):
         key: str,
         song: dict,
     ) -> None:
-        """发送歌曲（卡片或链接）并结束交互会话。"""
-        name = song.get("name", "未知歌曲")
+        """发送歌曲（卡片或链接）并结束交互会话。
+
+        播放成功后不追加“已发送《…》音乐卡片”之类提示（卡片本身即反馈），
+        并撤回本次交互的选择列表消息（仅 aiocqhttp 平台有效，失败静默）。
+        """
         ok = await self.sender.send_music_card(event, song.get("id"))
+        state = self._waiting.get(key)
         if ok:
-            await event.send(event.plain_result(f"已发送《{name}》音乐卡片"))
+            if state is not None:
+                await self.sender.recall_message(event, state.get("select_msg_id"))
         else:
             await event.send(
                 event.plain_result(
