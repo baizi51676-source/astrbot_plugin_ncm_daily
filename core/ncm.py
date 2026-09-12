@@ -4,8 +4,8 @@
 - 搜索：/api/search/get/web（无需 Cookie）
 - 账号：/api/nuser/account/get（需 Cookie）
 - 日推：/api/v1/discovery/recommend/songs（需 Cookie）
-- 歌单：/api/user/playlist、/api/v1/playlist/detail（歌单详情无需 Cookie）
-- 歌曲详情：/api/song/detail（批量，无需 Cookie）
+- 歌单：/api/user/playlist、/api/v1/playlist/detail（歌单详情无需 Cookie，含封面 coverImgUrl）
+- 歌曲详情：/api/song/detail（批量，无需 Cookie，含专辑封面 album.picUrl）
 """
 
 from __future__ import annotations
@@ -25,6 +25,25 @@ HEADERS = {
     ),
     "Referer": "https://music.163.com/",
 }
+
+COVER_SIZE = 500  # 封面图展示尺寸（正方形，px）
+
+
+def enhance_cover_url(url: str, size: int = COVER_SIZE) -> str:
+    """把网易云图片 URL 增强为指定尺寸的清晰版（追加 ?param=WxH）。
+
+    - http:// 图片自动升级为 https://
+    - 已有 param 参数或空 URL 时原样返回
+    """
+    url = (url or "").strip()
+    if not url:
+        return url
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    if "param=" in url:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}param={size}y{size}"
 
 
 class NCMError(Exception):
@@ -103,6 +122,18 @@ class NetEaseMusic:
             f"{API_BASE}/api/song/detail", {"ids": json.dumps(song_ids, separators=(",", ":"))}
         )
         return d.get("songs") or []
+
+    def get_song_cover(self, song_id: int | str, size: int = COVER_SIZE) -> str:
+        """获取歌曲封面（专辑封面）URL（无需 Cookie）。
+
+        Returns:
+            封面图 URL（默认 500x500 清晰版）；无封面时返回空字符串。
+        """
+        details = self.get_song_details([int(song_id)])
+        if not details:
+            return ""
+        album = details[0].get("album") or {}
+        return enhance_cover_url(album.get("picUrl") or "", size)
 
     # ---------- 歌单 ----------
 
