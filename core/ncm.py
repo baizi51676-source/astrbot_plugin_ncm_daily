@@ -1,16 +1,19 @@
 """网易云音乐 Web API 适配层（零第三方依赖，纯标准库实现）。
 
 使用网易云音乐官方老接口（无需 weapi 签名）：
-- 搜索：/api/search/get/web（无需 Cookie）
+- 搜索：/api/search/get/web（歌曲 type=1、歌单 type=1000，均无需 Cookie）
 - 账号：/api/nuser/account/get（需 Cookie）
 - 日推：/api/v1/discovery/recommend/songs（需 Cookie）
-- 歌单：/api/user/playlist、/api/v1/playlist/detail（歌单详情无需 Cookie，含封面 coverImgUrl）
+- 歌单：/api/user/playlist（需 Cookie）；/api/v1/playlist/detail（无需 Cookie，
+  含完整 trackIds；他人歌单内嵌曲目被截断时用 song/detail 分批补全）
 - 歌曲详情：/api/song/detail（批量，无需 Cookie，含专辑封面 album.picUrl）
 """
 
 from __future__ import annotations
 
 import json
+import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,20 +33,29 @@ COVER_SIZE = 500  # 封面图展示尺寸（正方形，px）
 
 
 def enhance_cover_url(url: str, size: int = COVER_SIZE) -> str:
-    """把网易云图片 URL 增强为指定尺寸的清晰版（追加 ?param=WxH）。
+    """归一化网易云图片 URL：先移除旧尺寸参数，再按档位追加清晰度参数。
 
+    - size > 0：强制为 ?param={size}y{size}（同档位保持一致，如 500/1600）
+    - size <= 0：原图模式（仅移除 param，返回上传原档，实测最高可达 3000px）
     - http:// 图片自动升级为 https://
-    - 已有 param 参数或空 URL 时原样返回
     """
     url = (url or "").strip()
     if not url:
         return url
     if url.startswith("http://"):
         url = "https://" + url[len("http://"):]
-    if "param=" in url:
-        return url
-    sep = "&" if "?" in url else "?"
-    return f"{url}{sep}param={size}y{size}"
+    if "?" in url:
+        base, query = url.split("?", 1)
+        keep = [
+            p
+            for p in query.split("&")
+            if p and not re.fullmatch(r"param=\d+y\d+", p)
+        ]
+        url = base + (("?" + "&".join(keep)) if keep else "")
+    if size and size > 0:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}param={size}y{size}"
+    return url
 
 
 class NCMError(Exception):
@@ -152,10 +164,29 @@ class NetEaseMusic:
         )
         return d.get("playlist") or []
 
+    def search_playlists(self, keyword: str, limit: int = 10) -> list[dict[str, Any]]:
+        """搜索歌单（无需 Cookie）。
+
+        Returns:
+            歌单 dict 列表，元素含 id/name/trackCount/playCount/creator/coverImgUrl。
+        """
+        d = self._request(
+            f"{API_BASE}/api/search/get/web",
+            {"s": keyword, "limit": limit, "type": 1000, "offset": 0},
+        )
+        return (d.get("result") or {}).get("playlists") or []
+
     def get_playlist_detail(
         self, playlist_id: int | str, limit: int = 30
     ) -> dict[str, Any] | None:
         """获取歌单详情（无需 Cookie）。
+
+        对他人歌单：详情接口只内嵌前 10~20 首，但 trackIds 完整——按需用
+        song/detail 分批（100 首/批）重建完整曲目（实测 668 首约 4.5 秒、
+        1214 首约 7 秒，控制 0.12s 批间隔避免风控）。
+
+        Args:
+            limit: 期望返回的最大曲目数（默认 30；交互流程传 100000 表示全量）。
 
         Returns:
             歌单 dict（含 name/trackCount/tracks）或 None。
@@ -167,19 +198,41 @@ class NetEaseMusic:
         playlist = d.get("playlist")
         if not playlist:
             return None
-        tracks = (playlist.get("tracks") or [])[:limit]
-        # 老接口返回的 track 可能是精简结构（只有 id/name，无 artists），且可能
-        # 只有部分 track 缺失（如前半有歌手、后半无）——不能只看第一首，只要
-        # 有任何一首缺歌手就批量补齐（超大歌单按 500 首一批，避免接口限制）
+
+        tracks = playlist.get("tracks") or []
+        track_ids = [
+            t.get("id") for t in (playlist.get("trackIds") or []) if t.get("id")
+        ]
+        # 需要的曲目 id（受 limit 限制）；详情内嵌曲目不足时（他人歌单被截断）分批重建
+        need_ids = track_ids[:limit] if limit and limit > 0 else track_ids
+        if need_ids and len(tracks) < len(need_ids):
+            detail_map: dict[int, dict] = {}
+            # song/detail 批量接口一次最多返回约 200 首，按 100 首一批更安全
+            for i in range(0, len(need_ids), 100):
+                try:
+                    batch = self.get_song_details(need_ids[i : i + 100])
+                except NCMError:
+                    batch = []  # 个别批次失败时跳过，返回其余曲目
+                for s in batch:
+                    if s.get("id") is not None:
+                        detail_map[s["id"]] = s
+                time.sleep(0.12)  # 控制请求频率，避免触发风控
+            rebuilt = [detail_map[tid] for tid in need_ids if tid in detail_map]
+            if rebuilt:
+                tracks = rebuilt
+        if limit and limit > 0:
+            tracks = tracks[:limit]
+
+        # 兜底：内嵌/重建的曲目仍可能缺歌手（老接口精简结构），批量补齐
         missing = [t for t in tracks if t.get("id") and not t.get("artists")]
         if missing:
-            detail_map: dict[int, dict] = {}
+            detail_map = {}
             ids = [t["id"] for t in missing]
-            # song/detail 批量接口一次最多返回约 200 首，按 100 首一批更安全
             for i in range(0, len(ids), 100):
                 for s in self.get_song_details(ids[i : i + 100]):
                     detail_map[s.get("id")] = s
             tracks = [detail_map.get(t.get("id"), t) for t in tracks]
+
         playlist["tracks"] = tracks
         return playlist
 

@@ -3,15 +3,17 @@
 功能：
 - 搜索音乐（无需 Cookie）
 - 发送网易云音乐卡片（QQ 群/私聊，NapCat 渲染）
-- 歌曲封面（无需 Cookie）
+- 歌曲封面（无需 Cookie，支持 低/高/原图 三档分辨率）
 - 每日推荐（需 MUSIC_U Cookie，仅管理员；菜单头部含第一首歌封面）
 - 个人歌单（需 MUSIC_U Cookie，仅管理员；选歌列表头部含歌单封面，支持多选与超长歌单分条展示）
+- 歌单搜索（搜索他人公开歌单：名称/歌单 ID，支持分页查看）
 - 点歌指令（白名单用户）
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 
 from astrbot.api import logger
@@ -20,7 +22,7 @@ from astrbot.api.message_components import Image, Node, Nodes, Plain
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
-from .core.ncm import NCMError, NetEaseMusic, enhance_cover_url
+from .core.ncm import COVER_SIZE, NCMError, NetEaseMusic, enhance_cover_url
 from .core.sender import MusicCardSender
 try:  # AstrBot v4 内部 API：aiocqhttp（NapCat/OneBot v11）平台事件
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
@@ -36,13 +38,18 @@ COOKIE_TIP = (
 )
 
 SONGS_PER_MSG = 100  # 合并转发卡片内每条消息最多展示的歌曲数（超出自动分多条）
+PAGE_SIZE = 100  # 分页模式每页歌曲数（如 537 首 = 6 页）
 MULTI_PLAY_LIMIT = 20  # 一次回复多个序号时最多播放的歌曲数
 MSG_LIMIT = 4000  # 单条消息安全长度（字符），超出则截断并提示翻页
 POINT_CMD = "点歌"  # 点歌指令前缀
-POINT_LIMIT = 10  # 点歌搜索结果数量
+PLAYLIST_CMD = "歌单"  # 歌单搜索指令前缀（搜索他人公开歌单）
+POINT_LIMIT = 20  # 点歌搜索结果数量（请求失败自动降级为 10）
+PLAYLIST_SEARCH_LIMIT = 20  # 歌单搜索结果数量（请求失败自动降级为 10）
+SEARCH_FALLBACK_LIMIT = 10  # 搜索失败时的降级数量
+PL_CMDS_MINE = ("我的歌单", "查看歌单")  # 个人歌单指令（「歌单」已改为搜索他人歌单）
 DAILY_CMDS = ("日推", "今日推荐")  # 日推指令
 COVER_CMDS = ("歌曲封面", "封面")  # 歌曲封面指令前缀（长的在前）
-WAIT_TIMEOUT = 120  # 歌单/日推交互等待超时（秒）
+WAIT_TIMEOUT = 60  # 歌单/日推/搜索交互等待超时（秒）
 POINT_TIMEOUT = 30  # 点歌交互等待超时（秒，默认）
 
 
@@ -68,6 +75,13 @@ class NcmDailyPlugin(Star):
             self.point_timeout = max(5, int(config.get("point_timeout", POINT_TIMEOUT)))
         except (TypeError, ValueError):
             self.point_timeout = POINT_TIMEOUT
+        # 封面分辨率档位：low=500x500 / high=1600x1600 / original=原图（不追加尺寸参数）
+        quality = str(config.get("cover_quality", "low") or "low").strip().lower()
+        self.cover_size = {"low": COVER_SIZE, "high": 1600, "original": 0}.get(
+            quality, COVER_SIZE
+        )
+        # 超大歌单分页模式：每 100 首一页（对「我的歌单」与「歌单」搜索的歌曲列表生效）
+        self.playlist_paging = bool(config.get("playlist_paging", False))
 
     # ---------- 等待状态与超时 ----------
 
@@ -76,9 +90,16 @@ class NcmDailyPlugin(Star):
     ) -> None:
         """注册等待状态后启动超时主动提示任务：到期自动发消息提醒用户。"""
         try:
-            asyncio.create_task(self._timeout_worker(key, state, event))
+            task = asyncio.create_task(self._timeout_worker(key, state, event))
         except RuntimeError:
-            pass  # 事件循环不可用时（极少数场景）退化为仅清理
+            return  # 事件循环不可用时（极少数场景）退化为仅清理
+        # 持有任务引用，避免被 GC 提前回收（RUF006）；同一会话可能存在多个并发超时任务
+        tasks = getattr(self, "_bg_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._bg_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     async def _timeout_worker(
         self, key: str, state: dict, event: AstrMessageEvent
@@ -100,6 +121,7 @@ class NcmDailyPlugin(Star):
                     "point": "点歌超时",
                     "daily": "日推选择超时",
                     "playlist": "选择超时",
+                    "pl_search": "歌单搜索超时",
                 }.get(mode, "选择超时")
                 await event.send(event.plain_result(f"{tip}，已退出。可重新发起。"))
         except Exception as e:
@@ -174,12 +196,34 @@ class NcmDailyPlugin(Star):
             return "你没有使用音乐功能的权限（需加入插件配置 point_song_allowlist 白名单）。"
         limit = max(1, min(int(limit), 20))
         try:
-            songs = self.ncm.search_songs(keyword, limit)
+            songs = await asyncio.to_thread(lambda: self.ncm.search_songs(keyword, limit))
         except NCMError as e:
             return f"搜索失败：{e}"
         if not songs:
             return f"没有找到与「{keyword}」相关的歌曲"
         return self._format_songs(songs)
+
+    @filter.llm_tool()
+    async def search_playlists(
+        self, event: AstrMessageEvent, keyword: str, limit: int = 10
+    ):
+        """搜索网易云歌单（他人公开歌单），返回歌单列表（序号、歌单名、创建者、歌曲数）。
+
+        Args:
+            keyword(string): 搜索关键词（歌单名/主题）
+            limit(int): 返回数量，默认 10，最大 20
+        """
+        # 权限：跟随音乐功能白名单（管理员始终可用；白名单留空 = 不限制）
+        if not self._can_point_song(event):
+            return "你没有使用音乐功能的权限（需加入插件配置 point_song_allowlist 白名单）。"
+        limit = max(1, min(int(limit), 20))
+        try:
+            playlists = await self._safe_search_playlists(keyword, limit)
+        except NCMError as e:
+            return f"搜索歌单失败：{e}"
+        if not playlists:
+            return f"没有找到与「{keyword}」相关的歌单"
+        return self._format_playlists(playlists, with_id=True)
 
     @filter.llm_tool()
     async def get_daily_recommend(self, event: AstrMessageEvent, count: int = 10):
@@ -194,7 +238,7 @@ class NcmDailyPlugin(Star):
             return COOKIE_TIP
         count = max(1, min(int(count), 20))
         try:
-            songs = self.ncm.get_daily_recommend()
+            songs = await asyncio.to_thread(lambda: self.ncm.get_daily_recommend())
         except NCMError as e:
             return f"获取每日推荐失败：{e}"
         if not songs:
@@ -213,7 +257,7 @@ class NcmDailyPlugin(Star):
         if not self.ncm.logged_in:
             return COOKIE_TIP
         try:
-            playlists = self.ncm.get_user_playlists(limit=30)
+            playlists = await asyncio.to_thread(lambda: self.ncm.get_user_playlists(limit=30))
         except NCMError as e:
             return f"获取歌单失败：{e}"
         if not playlists:
@@ -228,15 +272,16 @@ class NcmDailyPlugin(Star):
 
     @filter.llm_tool()
     async def get_playlist_detail(self, event: AstrMessageEvent, playlist_id: int):
-        """查看指定网易云歌单的歌曲列表（歌单 ID 来自 get_my_playlists 或用户提供）。
+        """查看指定网易云歌单的歌曲列表（歌单 ID 来自 get_my_playlists / search_playlists 或用户提供，支持他人公开歌单）。
 
         Args:
             playlist_id(int): 网易云歌单 ID
         """
-        if self.admin_only and not self._is_admin(event):
-            return self._admin_tip()
+        # 权限：跟随音乐功能白名单（管理员始终可用；白名单留空 = 不限制）
+        if not self._can_point_song(event):
+            return "你没有使用音乐功能的权限（需加入插件配置 point_song_allowlist 白名单）。"
         try:
-            playlist = self.ncm.get_playlist_detail(playlist_id, limit=30)
+            playlist = await asyncio.to_thread(lambda: self.ncm.get_playlist_detail(playlist_id, limit=30))
         except NCMError as e:
             return f"获取歌单详情失败：{e}"
         if not playlist:
@@ -286,16 +331,79 @@ class NcmDailyPlugin(Star):
             return "你没有使用音乐功能的权限（需加入插件配置 point_song_allowlist 白名单）。"
         return await self._fetch_and_send_cover(event, (keyword or "").strip())
 
+    # ---------- 搜索辅助（20 条优先，请求失败自动降级 10 条） ----------
+
+    async def _safe_search_songs(self, keyword: str, limit: int) -> list[dict]:
+        """搜索歌曲：请求 limit 条；请求失败时自动降级为 SEARCH_FALLBACK_LIMIT 条重试。
+
+        同步 HTTP 调用放入线程池，避免阻塞事件循环。
+        """
+        try:
+            return await asyncio.to_thread(lambda: self.ncm.search_songs(keyword, limit))
+        except NCMError:
+            if limit > SEARCH_FALLBACK_LIMIT:
+                return await asyncio.to_thread(lambda: self.ncm.search_songs(keyword, SEARCH_FALLBACK_LIMIT))
+            raise
+
+    async def _safe_search_playlists(self, keyword: str, limit: int) -> list[dict]:
+        """搜索歌单：请求 limit 条；请求失败时自动降级为 SEARCH_FALLBACK_LIMIT 条重试。
+
+        同步 HTTP 调用放入线程池，避免阻塞事件循环。
+        """
+        try:
+            return await asyncio.to_thread(lambda: self.ncm.search_playlists(keyword, limit))
+        except NCMError:
+            if limit > SEARCH_FALLBACK_LIMIT:
+                return await asyncio.to_thread(lambda: self.ncm.search_playlists(keyword, SEARCH_FALLBACK_LIMIT))
+            raise
+
+    @staticmethod
+    def _extract_playlist_id(query: str) -> int:
+        """从用户输入中提取歌单 ID（纯数字 / 含 ?id= 或长数字的链接），失败返回 0。"""
+        q = (query or "").strip()
+        if not q:
+            return 0
+        if q.isdigit():
+            return int(q)
+        m = re.search(r"[?&]id=(\d+)", q) or re.search(r"(\d{6,})", q)
+        return int(m.group(1)) if m else 0
+
+    def _format_playlists(self, playlists: list[dict], with_id: bool = False) -> str:
+        """格式化歌单列表（序号、歌单名、创建者、歌曲数、播放量；可选附歌单 ID）。"""
+        lines = []
+        for i, pl in enumerate(playlists, 1):
+            name = pl.get("name", "")
+            creator = (pl.get("creator") or {}).get("nickname", "")
+            tracks = pl.get("trackCount", 0)
+            plays = self._format_play_count(pl.get("playCount", 0))
+            suffix = f" id={pl.get('id')}" if with_id else ""
+            lines.append(f"{i}. {name} - {creator}（{tracks}首，播放 {plays}）{suffix}".rstrip())
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_play_count(count) -> str:
+        """播放量格式化：>= 1 万显示为 x.x万。"""
+        try:
+            n = int(count or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n >= 10000:
+            return f"{n / 10000:.1f}万"
+        return str(n)
+
     # ---------- 命令交互（我的歌单，自实现状态机） ----------
 
     @staticmethod
     def _session_key(event: AstrMessageEvent) -> str:
         return f"{event.unified_msg_origin}:{event.get_sender_id()}"
 
-    @filter.command("我的歌单", alias={"歌单", "查看歌单"})
+    @filter.command("我的歌单", alias={"查看歌单"})
     async def my_playlists_cmd(self, event: AstrMessageEvent):
-        """我的歌单、歌单、查看歌单：列出歌单，回复序号选择，再回复序号或歌名播放（仅本人可操作）"""
-        pass
+        """我的歌单、查看歌单：列出歌单，回复序号选择，再回复序号或歌名播放（仅本人可操作）"""
+
+    @filter.command("歌单")
+    async def playlist_search_cmd(self, event: AstrMessageEvent):
+        """歌单 [关键词|歌单ID]：搜索他人公开歌单，回复序号查看歌单歌曲（仅本人可操作，仅管理员）"""
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_my_playlists(self, event: AstrMessageEvent):
@@ -338,7 +446,12 @@ class NcmDailyPlugin(Star):
                 await self._cover_song(event, text[len(prefix):].strip())
                 return
 
-        if text not in ("我的歌单", "歌单", "查看歌单"):
+        # 歌单搜索指令（仅管理员，admin_only 可关）：歌单 + [关键词 | 歌单ID]
+        if text.startswith(PLAYLIST_CMD):
+            await self._playlist_search(event, key, text[len(PLAYLIST_CMD):].strip())
+            return
+
+        if text not in PL_CMDS_MINE:
             return
         event.stop_event()
 
@@ -351,7 +464,7 @@ class NcmDailyPlugin(Star):
             yield event.plain_result(COOKIE_TIP)
             return
         try:
-            playlists = self.ncm.get_user_playlists(limit=30)
+            playlists = await asyncio.to_thread(lambda: self.ncm.get_user_playlists(limit=30))
         except NCMError as e:
             yield event.plain_result(f"获取歌单失败：{e}")
             return
@@ -381,6 +494,113 @@ class NcmDailyPlugin(Star):
         if mid is not None:
             state["menu_msg_ids"].append(mid)
 
+    async def _playlist_search(
+        self, event: AstrMessageEvent, key: str, query: str
+    ) -> None:
+        """歌单指令：搜索他人公开歌单（名称）；或按歌单 ID 直达查看歌曲列表。"""
+        if not query:
+            await event.send(
+                event.plain_result(
+                    "用法：歌单 关键词（搜索歌单），或 歌单 歌单ID（直达查看）；"
+                    "例如：歌单 华语流行、歌单 3778678"
+                )
+            )
+            return
+        # 权限：跟随音乐功能白名单（管理员始终可用；白名单留空 = 不限制）
+        if not self._can_point_song(event):
+            await event.send(
+                event.plain_result(
+                    "你没有使用歌单搜索的权限（需加入插件配置 point_song_allowlist 白名单）。"
+                )
+            )
+            return
+        event.stop_event()
+
+        # 歌单 ID / 链接 → 直达查看
+        pid = self._extract_playlist_id(query)
+        if pid:
+            await self._open_playlist(event, key, pid)
+            return
+
+        # 名称搜索（20 条优先，失败自动降级 10 条）
+        try:
+            playlists = await self._safe_search_playlists(query, PLAYLIST_SEARCH_LIMIT)
+        except NCMError as e:
+            await event.send(event.plain_result(f"搜索歌单失败：{e}"))
+            return
+        if not playlists:
+            await event.send(event.plain_result(f"没有找到「{query}」相关的歌单"))
+            return
+
+        # 注册等待状态（歌单搜索模式：playlists=搜索结果，回复序号查看歌曲）
+        state = {
+            "playlists": playlists,
+            "tracks": [],
+            "offset": 0,
+            "expiry": time.time() + WAIT_TIMEOUT,
+            "mode": "pl_search",
+            "menu_msg_ids": [],
+        }
+        self._waiting[key] = state
+        logger.debug(f"[ncm] 歌单搜索已注册等待状态: {key}")
+        self._start_timeout_task(key, state, event)
+
+        items = self._format_playlists(playlists).split("\n")
+        cover = ""
+        if playlists:
+            cover = enhance_cover_url(
+                playlists[0].get("coverImgUrl") or "", self.cover_size
+            )
+        mid = await self._send_text_list(
+            event,
+            f"「{query}」的歌单搜索结果（回复序号查看歌单歌曲，仅你本人可操作）：",
+            items,
+            hint="回复序号选择歌单",
+            image=cover,
+        )
+        if mid is not None:
+            state["menu_msg_ids"].append(mid)
+
+    async def _open_playlist(
+        self, event: AstrMessageEvent, key: str, playlist_id: int
+    ) -> None:
+        """按歌单 ID 拉取完整曲目并发送歌曲列表（分页模式下先发送第 1 页）。"""
+        try:
+            detail = await asyncio.to_thread(lambda: self.ncm.get_playlist_detail(playlist_id, limit=100000))
+        except NCMError as e:
+            await event.send(event.plain_result(f"获取歌单失败：{e}"))
+            return
+        tracks = (detail or {}).get("tracks") or []
+        if not detail or not tracks:
+            await event.send(
+                event.plain_result(
+                    f"没有找到歌单（ID: {playlist_id}）或该歌单暂无可展示的歌曲"
+                )
+            )
+            return
+
+        state = {
+            "playlists": [],
+            "tracks": tracks,
+            "offset": 0,
+            "expiry": time.time() + WAIT_TIMEOUT,
+            "mode": "playlist",
+            "menu_msg_ids": [],
+            "detail_name": detail.get("name") or "",
+            "cover": enhance_cover_url(
+                detail.get("coverImgUrl") or "", self.cover_size
+            ),
+        }
+        self._waiting[key] = state
+        logger.debug(f"[ncm] 歌单直达已注册等待状态: {key}")
+        self._start_timeout_task(key, state, event)
+
+        if self.playlist_paging:
+            state["paging"] = True
+            await self._send_song_page(event, state, 1)
+        else:
+            await self._send_song_list(event, detail, tracks, 0, state)
+
     async def _point_song(self, event: AstrMessageEvent, key: str, query: str) -> None:
         """点歌指令：搜索歌曲并列出（回复序号播放）。"""
         if not query:
@@ -406,7 +626,7 @@ class NcmDailyPlugin(Star):
             return
 
         try:
-            songs = self.ncm.search_songs(keyword, POINT_LIMIT)
+            songs = await self._safe_search_songs(keyword, POINT_LIMIT)
         except NCMError as e:
             await event.send(event.plain_result(f"搜索失败：{e}"))
             return
@@ -469,14 +689,14 @@ class NcmDailyPlugin(Star):
         if not keyword:
             return "歌名不能为空"
         try:
-            songs = self.ncm.search_songs(keyword, 1)
+            songs = await asyncio.to_thread(lambda: self.ncm.search_songs(keyword, 1))
         except NCMError as e:
             return f"搜索失败：{e}"
         if not songs:
             return f"没有找到「{keyword}」相关的歌曲"
         song = songs[0]
         try:
-            cover = self.ncm.get_song_cover(song.get("id"))
+            cover = await asyncio.to_thread(lambda: self.ncm.get_song_cover(song.get("id"), self.cover_size))
         except NCMError as e:
             return f"获取封面失败：{e}"
         if not cover:
@@ -498,7 +718,7 @@ class NcmDailyPlugin(Star):
             await event.send(event.plain_result(COOKIE_TIP))
             return
         try:
-            songs = self.ncm.get_daily_recommend()
+            songs = await asyncio.to_thread(lambda: self.ncm.get_daily_recommend())
         except NCMError as e:
             await event.send(event.plain_result(f"获取每日推荐失败：{e}"))
             return
@@ -524,7 +744,7 @@ class NcmDailyPlugin(Star):
         first = songs[0] if songs else None
         if first and first.get("id"):
             try:
-                cover = self.ncm.get_song_cover(first.get("id"))
+                cover = await asyncio.to_thread(lambda: self.ncm.get_song_cover(first.get("id"), self.cover_size))
             except NCMError:
                 cover = ""
 
@@ -560,26 +780,87 @@ class NcmDailyPlugin(Star):
                 return
             pl = state["playlists"][idx - 1]
             try:
-                detail = self.ncm.get_playlist_detail(pl.get("id"), limit=100000)
+                track_count = int(pl.get("trackCount") or 0)
+            except (TypeError, ValueError):
+                track_count = 0
+            if state.get("mode") == "pl_search" and track_count > 200:
+                await self._send_plain_tracked(
+                    event,
+                    f"正在加载歌单《{pl.get('name')}》的完整曲目"
+                    f"（共 {track_count} 首），请稍候…",
+                    state,
+                )
+            try:
+                detail = await asyncio.to_thread(lambda: self.ncm.get_playlist_detail(pl.get("id"), limit=100000))
             except NCMError as e:
                 await event.send(event.plain_result(f"获取歌单失败：{e}"))
+                await self._recall_menus(event, state)
                 self._waiting.pop(key, None)
                 return
             if not detail:
                 await event.send(event.plain_result("歌单不存在"))
+                await self._recall_menus(event, state)
                 self._waiting.pop(key, None)
                 return
             state["tracks"] = detail.get("tracks") or []
             state["offset"] = 0
             state["expiry"] = time.time() + WAIT_TIMEOUT
-            await self._send_song_list(event, detail, state["tracks"], 0, state)
+            state["detail_name"] = detail.get("name") or ""
+            state["cover"] = enhance_cover_url(
+                detail.get("coverImgUrl") or "", self.cover_size
+            )
+            if not state["tracks"]:
+                await event.send(event.plain_result("该歌单暂无可展示的歌曲"))
+                await self._recall_menus(event, state)
+                self._waiting.pop(key, None)
+                return
+            if self.playlist_paging:
+                state["paging"] = True
+                await self._send_song_page(event, state, 1)
+            else:
+                await self._send_song_list(event, detail, state["tracks"], 0, state)
             return
 
         # ---- 阶段2：选择歌曲 ----
         low = text.lower()
-        if low in ("更多", "下一页", "下页"):
+
+        # 分页模式：翻页指令（第N页 / 下一页 / 上一页）
+        if state.get("paging"):
+            total = len(state["tracks"])
+            pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+            current = int(state.get("page") or 1)
+            target = None
+            m = re.fullmatch(r"第?\s*(\d+)\s*页", text)
+            if m:
+                target = int(m.group(1))
+            elif low in ("更多", "下一页", "下页"):
+                target = current + 1
+            elif low in ("上一页", "上页"):
+                target = current - 1
+            if target is not None:
+                if target < 1 or target > pages:
+                    await event.send(
+                        event.plain_result(
+                            f"页码超出范围（1-{pages}），本歌单共 {total} 首"
+                        )
+                    )
+                    return
+                state["expiry"] = time.time() + WAIT_TIMEOUT
+                await self._send_song_page(event, state, target)
+                return
+
+        if re.fullmatch(r"第?\s*\d+\s*页", text) or low in (
+            "上一页",
+            "上页",
+            "下一页",
+            "下页",
+            "更多",
+        ):
             await event.send(
-                event.plain_result("歌曲已一次性完整展示，请直接回复序号（支持多个，如 1 7 98）")
+                event.plain_result(
+                    "当前为完整展示模式（歌曲已一次性全部发出），请直接回复序号；"
+                    "如需分页浏览，可在插件配置中开启「超大歌单分页展示」"
+                )
             )
             return
 
@@ -607,7 +888,7 @@ class NcmDailyPlugin(Star):
 
         # 按歌名搜索并播放
         try:
-            songs = self.ncm.search_songs(text, 1)
+            songs = await asyncio.to_thread(lambda: self.ncm.search_songs(text, 1))
         except NCMError as e:
             await event.send(event.plain_result(f"搜索失败：{e}"))
             return
@@ -617,6 +898,33 @@ class NcmDailyPlugin(Star):
         await self._send_and_stop(event, key, songs[0])
 
     # ---------- 交互辅助 ----------
+
+    async def _send_plain_tracked(
+        self, event: AstrMessageEvent, text: str, state: dict
+    ) -> None:
+        """发送普通文本；aiocqhttp 平台下记录 message_id，随菜单一起撤回。"""
+        if AiocqhttpMessageEvent is not None and isinstance(
+            event, AiocqhttpMessageEvent
+        ):
+            payloads: dict = {"message": [{"type": "text", "data": {"text": text}}]}
+            try:
+                if event.is_private_chat():
+                    payloads["user_id"] = event.get_sender_id()
+                    result = await event.bot.api.call_action(
+                        "send_private_msg", **payloads
+                    )
+                else:
+                    payloads["group_id"] = event.get_group_id()
+                    result = await event.bot.api.call_action(
+                        "send_group_msg", **payloads
+                    )
+                mid = (result or {}).get("message_id")
+                if mid is not None:
+                    state.setdefault("menu_msg_ids", []).append(int(mid))
+                return
+            except Exception as e:
+                logger.warning(f"[ncm] 普通文本发送失败，降级为常规消息: {e}")
+        await event.send(event.plain_result(text))
 
     async def _send_text_list(
         self,
@@ -765,7 +1073,7 @@ class NcmDailyPlugin(Star):
             title = f"歌单「{detail.get('name')}」共 {total} 首："
         else:
             title = f"共 {total_view} 首："
-        cover = enhance_cover_url((detail or {}).get("coverImgUrl") or "")
+        cover = enhance_cover_url((detail or {}).get("coverImgUrl") or "", self.cover_size)
         if not cover and state is not None:
             cover = state.get("cover", "")
         if state is not None and cover:
@@ -787,6 +1095,48 @@ class NcmDailyPlugin(Star):
         if state is not None and mid is not None:
             state.setdefault("menu_msg_ids", []).append(mid)
         return mid
+
+    async def _send_song_page(
+        self, event: AstrMessageEvent, state: dict, page: int
+    ) -> None:
+        """分页模式：发送指定页的歌曲列表（每页 PAGE_SIZE 首，序号全局连续）。
+
+        翻页时保留历史页卡片，交互结束/超时时统一撤回全部菜单卡片。
+        """
+        tracks = state["tracks"]
+        total = len(tracks)
+        pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = min(max(1, int(page)), pages)
+        state["page"] = page
+        start = (page - 1) * PAGE_SIZE
+        chunk = tracks[start : start + PAGE_SIZE]
+        name = state.get("detail_name") or ""
+        if name:
+            title = (
+                f"歌单「{name}」共 {total} 首 · "
+                f"第 {page}/{pages} 页（{start + 1}-{start + len(chunk)}）："
+            )
+        else:
+            title = (
+                f"共 {total} 首 · 第 {page}/{pages} 页"
+                f"（{start + 1}-{start + len(chunk)}）："
+            )
+        items = []
+        for i, s in enumerate(chunk, start + 1):
+            artists = "、".join(
+                a.get("name", "") for a in (s.get("artists") or [])
+            )
+            items.append(f"{i}. {s.get('name')} - {artists}")
+        mid = await self._send_text_list(
+            event,
+            title,
+            items,
+            hint="回复序号播放（支持多个，如 1 3 5）；回复「第N页」翻页",
+            image=state.get("cover", ""),
+            per_msg=PAGE_SIZE,
+        )
+        if mid is not None:
+            state.setdefault("menu_msg_ids", []).append(mid)
 
     async def _send_and_stop(
         self,
