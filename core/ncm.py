@@ -4,6 +4,8 @@
 - 搜索：/api/search/get/web（歌曲 type=1、歌单 type=1000，均无需 Cookie）
 - 账号：/api/nuser/account/get（需 Cookie）
 - 日推：/api/v1/discovery/recommend/songs（需 Cookie）
+- 私人FM：/api/radio/get（需 Cookie，每次返回 3 首且与上一批不重复的推荐流）
+- 私人雷达：歌单 3136952023（官方算法歌单，每日更新，登录后按账号口味个性化）
 - 歌单：/api/user/playlist（需 Cookie）；/api/v1/playlist/detail（无需 Cookie，
   含完整 trackIds；他人歌单内嵌曲目被截断时用 song/detail 分批补全）
 - 歌曲详情：/api/song/detail（批量，无需 Cookie，含专辑封面 album.picUrl）
@@ -30,6 +32,10 @@ HEADERS = {
 }
 
 COVER_SIZE = 500  # 封面图展示尺寸（正方形，px）
+
+PRIVATE_RADAR_ID = 3136952023  # 私人雷达：官方算法歌单（每日更新，内容按登录账号个性化）
+FM_BATCH_SIZE = 3  # 私人FM 单次请求返回的歌曲数（网易云固定 3 首/次）
+FM_MAX_ROUNDS = 12  # 私人FM 单次调用最多请求轮数（上限 36 首，防止异常时长时间循环）
 
 
 def enhance_cover_url(url: str, size: int = COVER_SIZE) -> str:
@@ -256,3 +262,59 @@ class NetEaseMusic:
         if pending_ids:
             songs.extend(self.get_song_details(pending_ids))
         return songs
+
+    # ---------- 私人FM / 私人雷达 ----------
+
+    def get_personal_fm(self, limit: int = 15) -> list[dict[str, Any]]:
+        """获取私人FM推荐歌曲（需 Cookie，个性化推荐流）。
+
+        网易云 /api/radio/get 每次返回 3 首，且与上一批不重复（流式推荐）；
+        本方法按需连续取多轮并拼接（轮间 0.15s 间隔控制频率）。
+        注意：未登录时该接口会返回 1 首兜底歌曲，调用方应先检查 logged_in。
+
+        Args:
+            limit: 期望返回的歌曲数（默认 15 = 5 轮；受 FM_MAX_ROUNDS 上限约束）
+
+        Returns:
+            歌曲 dict 列表（含 id/name/artists/album/duration）。
+        """
+        want = max(1, int(limit or 1))
+        rounds = min(FM_MAX_ROUNDS, (want + FM_BATCH_SIZE - 1) // FM_BATCH_SIZE)
+        songs: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for i in range(rounds):
+            d = self._request(f"{API_BASE}/api/radio/get", {})
+            batch = d.get("data") or []
+            if not batch:
+                break  # 推荐流取空（异常或已到尽头）
+            added = 0
+            for s in batch:
+                sid = s.get("id")
+                if sid is None or sid in seen:
+                    continue
+                seen.add(sid)
+                songs.append(s)
+                added += 1
+            if not added or len(songs) >= want:
+                break
+            if i < rounds - 1:
+                time.sleep(0.15)  # 控制请求频率，避免触发风控
+        return songs[:want]
+
+    def get_private_radar(self, limit: int = 0) -> list[dict[str, Any]]:
+        """获取「私人雷达」歌单曲目（需 Cookie，按账号口味个性化）。
+
+        私人雷达是官方算法歌单（id=PRIVATE_RADAR_ID，每日更新，约 35 首），
+        登录后接口按账号口味返回个性化曲目（未登录时返回通用兜底内容）；
+        详情接口内嵌曲目被截断，由 get_playlist_detail 用 song/detail 补全。
+
+        Args:
+            limit: 最大返回数量（0 或负数 = 全量）
+
+        Returns:
+            歌曲 dict 列表（含 id/name/artists/album）。
+        """
+        detail = self.get_playlist_detail(
+            PRIVATE_RADAR_ID, limit=limit if limit and limit > 0 else 100000
+        )
+        return (detail or {}).get("tracks") or []

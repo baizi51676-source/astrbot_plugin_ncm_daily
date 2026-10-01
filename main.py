@@ -5,6 +5,8 @@
 - 发送网易云音乐卡片（QQ 群/私聊，NapCat 渲染）
 - 歌曲封面（无需 Cookie，支持 低/高/原图 三档分辨率）
 - 每日推荐（需 MUSIC_U Cookie，仅管理员；菜单头部含第一首歌封面）
+- 私人FM（需 MUSIC_U Cookie，仅管理员；个性化推荐流，回复「更多」继续推荐）
+- 私人雷达（需 MUSIC_U Cookie，仅管理员；每日更新的个性化算法歌单）
 - 个人歌单（需 MUSIC_U Cookie，仅管理员；选歌列表头部含歌单封面，支持多选与超长歌单分条展示）
 - 歌单搜索（搜索他人公开歌单：名称/歌单 ID，支持分页查看）
 - 点歌指令（白名单用户）
@@ -22,7 +24,13 @@ from astrbot.api.message_components import Image, Node, Nodes, Plain
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
-from .core.ncm import COVER_SIZE, NCMError, NetEaseMusic, enhance_cover_url
+from .core.ncm import (
+    COVER_SIZE,
+    NCMError,
+    PRIVATE_RADAR_ID,
+    NetEaseMusic,
+    enhance_cover_url,
+)
 from .core.sender import MusicCardSender
 try:  # AstrBot v4 内部 API：aiocqhttp（NapCat/OneBot v11）平台事件
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
@@ -48,6 +56,20 @@ PLAYLIST_SEARCH_LIMIT = 20  # 歌单搜索结果数量（请求失败自动降�
 SEARCH_FALLBACK_LIMIT = 10  # 搜索失败时的降级数量
 PL_CMDS_MINE = ("我的歌单", "查看歌单")  # 个人歌单指令（「歌单」已改为搜索他人歌单）
 DAILY_CMDS = ("日推", "今日推荐")  # 日推指令
+RADAR_CMDS = ("私人雷达", "雷达歌单", "雷达")  # 私人雷达指令（精确匹配）
+FM_CMDS = ("私人fm", "fm")  # 私人FM指令（精确匹配，不区分大小写）
+FM_FETCH_LIMIT = 15  # 每次获取的私人FM歌曲数（3 首/轮 × 5 轮）
+FM_MAX_TRACKS = 60  # 单次交互内私人FM列表上限（「更多」追加不超过该数量）
+FM_MORE_WORDS = ("更多", "换一批", "换一换", "再来一批")  # 私人FM「追加推荐」指令词
+LOCAL_MATCH_MODES = ("playlist", "pl_search", "radar", "daily", "fm")  # 列表类交互（回复歌名只在本列表内匹配）
+MODE_NAMES = {  # 未命中提示中使用的列表名称
+    "playlist": "该歌单",
+    "pl_search": "该歌单",
+    "radar": "私人雷达",
+    "daily": "今日推荐",
+    "fm": "私人FM",
+}
+MATCH_PREVIEW_LIMIT = 10  # 歌单内歌名匹配多条时，列出前 N 条供回复序号
 COVER_CMDS = ("歌曲封面", "封面")  # 歌曲封面指令前缀（长的在前）
 WAIT_TIMEOUT = 60  # 歌单/日推/搜索交互等待超时（秒）
 POINT_TIMEOUT = 30  # 点歌交互等待超时（秒，默认）
@@ -122,6 +144,8 @@ class NcmDailyPlugin(Star):
                     "daily": "日推选择超时",
                     "playlist": "选择超时",
                     "pl_search": "歌单搜索超时",
+                    "radar": "私人雷达选择超时",
+                    "fm": "私人FM选择超时",
                 }.get(mode, "选择超时")
                 await event.send(event.plain_result(f"{tip}，已退出。可重新发起。"))
         except Exception as e:
@@ -244,6 +268,51 @@ class NcmDailyPlugin(Star):
         if not songs:
             return "今日日推为空，可能是 Cookie 已失效或今日暂无推荐"
         return self._format_songs(songs[:count])
+
+    @filter.llm_tool()
+    async def get_personal_fm(self, event: AstrMessageEvent, count: int = 15):
+        """获取网易云私人FM推荐歌曲（个性化推荐流，需配置 MUSIC_U Cookie，仅管理员）。
+
+        Args:
+            count(int): 返回数量，默认 15，最大 30
+        """
+        if self.admin_only and not self._is_admin(event):
+            return self._admin_tip()
+        if not self.ncm.logged_in:
+            return COOKIE_TIP
+        count = max(1, min(int(count), 30))
+        try:
+            songs = await asyncio.to_thread(lambda: self.ncm.get_personal_fm(count))
+        except NCMError as e:
+            return f"获取私人FM失败：{e}"
+        if not songs:
+            return "私人FM暂时没有返回歌曲，可能是 Cookie 已失效"
+        return self._format_songs(songs)
+
+    @filter.llm_tool()
+    async def get_private_radar(self, event: AstrMessageEvent, count: int = 0):
+        """获取网易云「私人雷达」歌单曲目（每日更新，按你的听歌口味生成，需配置 MUSIC_U Cookie，仅管理员）。
+
+        Args:
+            count(int): 返回数量，默认 0 = 全部（约 35 首），最大 50
+        """
+        if self.admin_only and not self._is_admin(event):
+            return self._admin_tip()
+        if not self.ncm.logged_in:
+            return COOKIE_TIP
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            count = min(count, 50)
+        try:
+            songs = await asyncio.to_thread(lambda: self.ncm.get_private_radar(count))
+        except NCMError as e:
+            return f"获取私人雷达失败：{e}"
+        if not songs:
+            return "私人雷达暂时没有可展示的歌曲，可能是 Cookie 已失效"
+        return self._format_songs(songs)
 
     @filter.llm_tool()
     async def get_my_playlists(self, event: AstrMessageEvent):
@@ -429,6 +498,17 @@ class NcmDailyPlugin(Star):
         if not event.is_at_or_wake_command:
             return
         text = event.message_str.strip()
+        low = text.casefold()
+
+        # 私人FM指令（仅管理员，admin_only 可关）：私人FM / fm
+        if low in FM_CMDS:
+            await self._personal_fm(event, key)
+            return
+
+        # 私人雷达指令（仅管理员，admin_only 可关）：私人雷达 / 雷达歌单 / 雷达
+        if text in RADAR_CMDS:
+            await self._private_radar(event, key)
+            return
 
         # 点歌指令（白名单）：点歌 [歌手 - ]歌名
         if text.startswith(POINT_CMD):
@@ -740,24 +820,159 @@ class NcmDailyPlugin(Star):
         self._start_timeout_task(key, state, event)
 
         # 菜单头部图：使用第一首歌的封面（获取失败则不带图）
-        cover = ""
-        first = songs[0] if songs else None
-        if first and first.get("id"):
-            try:
-                cover = await asyncio.to_thread(lambda: self.ncm.get_song_cover(first.get("id"), self.cover_size))
-            except NCMError:
-                cover = ""
+        cover = await self._first_cover(songs)
 
-        items = [self._format_song(i, s) for i, s in enumerate(songs, 1)]
+        items = [self._format_song_brief(i, s) for i, s in enumerate(songs, 1)]
         mid = await self._send_text_list(
             event,
             "今日推荐（回复序号播放，仅你本人可操作）：",
             items,
-            hint="回复序号播放，或直接回复歌名搜索",
+            hint="回复序号播放；也可回复歌名/歌手在本列表中查找",
             image=cover,
         )
         if mid is not None:
             state["menu_msg_ids"].append(mid)
+
+    async def _first_cover(self, songs: list[dict]) -> str:
+        """取列表第一首歌的封面 URL（用作菜单头图）；获取失败返回空串。"""
+        first = songs[0] if songs else None
+        if not (first and first.get("id")):
+            return ""
+        try:
+            return await asyncio.to_thread(
+                lambda: self.ncm.get_song_cover(first.get("id"), self.cover_size)
+            )
+        except NCMError:
+            return ""
+
+    async def _personal_fm(self, event: AstrMessageEvent, key: str) -> None:
+        """私人FM指令：拉取个性化推荐流，回复序号播放；回复「更多」继续推荐。"""
+        event.stop_event()
+        if self.admin_only and not self._is_admin(event):
+            await event.send(event.plain_result(self._admin_tip()))
+            return
+        if not self.ncm.logged_in:
+            await event.send(event.plain_result(COOKIE_TIP))
+            return
+        try:
+            songs = await asyncio.to_thread(lambda: self.ncm.get_personal_fm(FM_FETCH_LIMIT))
+        except NCMError as e:
+            await event.send(event.plain_result(f"获取私人FM失败：{e}"))
+            return
+        if not songs:
+            await event.send(
+                event.plain_result("私人FM暂时没有返回歌曲，可能是 Cookie 已失效，请稍后重试")
+            )
+            return
+
+        # 注册等待状态（私人FM 模式：playlists 为空，tracks=推荐流；回复「更多」追加）
+        state = {
+            "playlists": [],
+            "tracks": songs,
+            "offset": 0,
+            "expiry": time.time() + WAIT_TIMEOUT,
+            "mode": "fm",
+            "menu_msg_ids": [],
+        }
+        self._waiting[key] = state
+        logger.debug(f"[ncm] 私人FM已注册等待状态: {key}")
+        self._start_timeout_task(key, state, event)
+
+        items = [self._format_song_brief(i, s) for i, s in enumerate(songs, 1)]
+        mid = await self._send_text_list(
+            event,
+            "私人FM（回复序号播放，仅你本人可操作）：",
+            items,
+            hint="回复序号播放（支持多个，如 1 3 5）；回复「更多」再推荐一批；也可回复歌名/歌手查找",
+            image=await self._first_cover(songs),
+        )
+        if mid is not None:
+            state["menu_msg_ids"].append(mid)
+
+    async def _fm_append(self, event: AstrMessageEvent, key: str, state: dict) -> None:
+        """私人FM：回复「更多」时追加下一批推荐（去重，列表上限 FM_MAX_TRACKS）。"""
+        if len(state["tracks"]) >= FM_MAX_TRACKS:
+            await event.send(
+                event.plain_result(
+                    f"本次已推荐 {FM_MAX_TRACKS} 首（上限），可回复序号播放，"
+                    "或重新发送「私人FM」开始新一轮"
+                )
+            )
+            return
+        try:
+            songs = await asyncio.to_thread(lambda: self.ncm.get_personal_fm(FM_FETCH_LIMIT))
+        except NCMError as e:
+            await event.send(event.plain_result(f"获取私人FM失败：{e}"))
+            return
+
+        known = {s.get("id") for s in state["tracks"]}
+        room = FM_MAX_TRACKS - len(state["tracks"])
+        fresh = [s for s in songs if s.get("id") not in known][:room]
+        if not fresh:
+            await event.send(
+                event.plain_result("暂时没有更多推荐了，可回复序号播放或稍后再试")
+            )
+            return
+
+        start = len(state["tracks"])
+        state["tracks"].extend(fresh)
+        state["expiry"] = time.time() + WAIT_TIMEOUT
+
+        items = [self._format_song_brief(i, s) for i, s in enumerate(fresh, start + 1)]
+        mid = await self._send_text_list(
+            event,
+            f"私人FM · 追加推荐（{start + 1}-{start + len(fresh)}，回复序号播放）：",
+            items,
+            hint="回复序号播放；回复「更多」继续推荐（可回复歌名/歌手查找）",
+        )
+        if mid is not None:
+            state.setdefault("menu_msg_ids", []).append(mid)
+
+    async def _private_radar(self, event: AstrMessageEvent, key: str) -> None:
+        """私人雷达指令：拉取「私人雷达」歌单曲目（每日更新、按口味个性化），回复序号播放。"""
+        event.stop_event()
+        if self.admin_only and not self._is_admin(event):
+            await event.send(event.plain_result(self._admin_tip()))
+            return
+        if not self.ncm.logged_in:
+            await event.send(event.plain_result(COOKIE_TIP))
+            return
+        try:
+            detail = await asyncio.to_thread(
+                lambda: self.ncm.get_playlist_detail(PRIVATE_RADAR_ID, limit=100000)
+            )
+        except NCMError as e:
+            await event.send(event.plain_result(f"获取私人雷达失败：{e}"))
+            return
+        tracks = (detail or {}).get("tracks") or []
+        if not detail or not tracks:
+            await event.send(
+                event.plain_result("私人雷达暂时没有可展示的歌曲，可能是 Cookie 已失效")
+            )
+            return
+
+        # 注册等待状态（私人雷达模式：与歌单详情同样支持多选与分页浏览）
+        state = {
+            "playlists": [],
+            "tracks": tracks,
+            "offset": 0,
+            "expiry": time.time() + WAIT_TIMEOUT,
+            "mode": "radar",
+            "menu_msg_ids": [],
+            "detail_name": "私人雷达",
+            "cover": enhance_cover_url(
+                detail.get("coverImgUrl") or "", self.cover_size
+            ),
+        }
+        self._waiting[key] = state
+        logger.debug(f"[ncm] 私人雷达已注册等待状态: {key}")
+        self._start_timeout_task(key, state, event)
+
+        if self.playlist_paging:
+            state["paging"] = True
+            await self._send_song_page(event, state, 1)
+        else:
+            await self._send_song_list(event, detail, tracks, 0, state)
 
     async def _handle_input(self, event: AstrMessageEvent, key: str, state: dict) -> None:
         """处理等待中的用户输入：选歌单 / 选歌 / 翻页 / 歌名搜索。"""
@@ -849,6 +1064,12 @@ class NcmDailyPlugin(Star):
                 await self._send_song_page(event, state, target)
                 return
 
+        # 私人FM：回复「更多」→追加下一批推荐（不走分页/完整展示分支）
+        if state.get("mode") == "fm" and low in FM_MORE_WORDS:
+            state["expiry"] = time.time() + WAIT_TIMEOUT
+            await self._fm_append(event, key, state)
+            return
+
         if re.fullmatch(r"第?\s*\d+\s*页", text) or low in (
             "上一页",
             "上页",
@@ -886,7 +1107,13 @@ class NcmDailyPlugin(Star):
             await self._send_and_stop(event, key, state["tracks"][idx - 1])
             return
 
-        # 按歌名搜索并播放
+        # 歌单类交互（歌单详情 / 歌单搜索 / 私人雷达）：回复歌名只在本歌单内匹配，
+        # 不在歌单里则提示（不再跳出歌单做全站搜索）；全站搜索请显式使用「点歌 XXX」
+        if state.get("mode") in LOCAL_MATCH_MODES:
+            await self._pick_in_tracks(event, key, state, text)
+            return
+
+        # 点歌 / 日推 / 私人FM：回复歌名 → 全站搜索并播放
         try:
             songs = await asyncio.to_thread(lambda: self.ncm.search_songs(text, 1))
         except NCMError as e:
@@ -896,6 +1123,56 @@ class NcmDailyPlugin(Star):
             await event.send(event.plain_result(f"没有找到「{text}」相关的歌曲"))
             return
         await self._send_and_stop(event, key, songs[0])
+
+    async def _pick_in_tracks(
+        self, event: AstrMessageEvent, key: str, state: dict, text: str
+    ) -> None:
+        """歌单类交互中回复歌名：只在本歌单内匹配（不跳出歌单做全站搜索）。
+
+        - 命中 1 首：直接播放；
+        - 命中多首：列出匹配项在本歌单内的序号，等待用户回复序号；
+        - 未命中：提示歌单内没有这首歌，并给出「点歌 XXX」的全站搜索入口。
+        """
+        query = text.strip().casefold()
+        matches: list[tuple[int, dict]] = []
+        for i, s in enumerate(state["tracks"], 1):
+            name = str(s.get("name") or "").casefold()
+            artists = "、".join(
+                str(a.get("name") or "") for a in (s.get("artists") or [])
+            ).casefold()
+            if query and (query in name or query in artists):
+                matches.append((i, s))
+
+        pl_name = state.get("detail_name") or MODE_NAMES.get(
+            state.get("mode"), "该列表"
+        )
+        if not matches:
+            state["expiry"] = time.time() + WAIT_TIMEOUT
+            await event.send(
+                event.plain_result(
+                    f"没有找到「{text}」：「{pl_name}」里没有这首歌。"
+                    f"如需在网易云全站搜索，请回复「点歌 {text}」"
+                )
+            )
+            return
+
+        if len(matches) == 1:
+            await self._send_and_stop(event, key, matches[0][1])
+            return
+
+        state["expiry"] = time.time() + WAIT_TIMEOUT
+        show = matches[:MATCH_PREVIEW_LIMIT]
+        title = f"「{pl_name}」内有 {len(matches)} 首匹配「{text}」（回复序号播放）："
+        if len(matches) > len(show):
+            title += f"\n（共 {len(matches)} 首匹配，仅列出前 {len(show)} 首）"
+        mid = await self._send_text_list(
+            event,
+            title,
+            [self._format_song_brief(i, s) for i, s in show],
+            hint="回复序号播放（支持多个，如 1 3 5）",
+        )
+        if mid is not None:
+            state.setdefault("menu_msg_ids", []).append(mid)
 
     # ---------- 交互辅助 ----------
 
@@ -1078,17 +1355,12 @@ class NcmDailyPlugin(Star):
             cover = state.get("cover", "")
         if state is not None and cover:
             state["cover"] = cover
-        items = []
-        for i, s in enumerate(tracks, 1):
-            artists = "、".join(
-                a.get("name", "") for a in (s.get("artists") or [])
-            )
-            items.append(f"{i}. {s.get('name')} - {artists}")
+        items = [self._format_song_brief(i, s) for i, s in enumerate(tracks, 1)]
         mid = await self._send_text_list(
             event,
             title,
             items,
-            hint="回复序号播放（支持一次回复多个序号，用空格分隔，如 1 7 98）",
+            hint="回复序号播放（支持多个，如 1 7 98）；也可回复歌名/歌手在歌单内查找",
             image=cover,
             per_msg=SONGS_PER_MSG,
         )
@@ -1121,12 +1393,7 @@ class NcmDailyPlugin(Star):
                 f"共 {total} 首 · 第 {page}/{pages} 页"
                 f"（{start + 1}-{start + len(chunk)}）："
             )
-        items = []
-        for i, s in enumerate(chunk, start + 1):
-            artists = "、".join(
-                a.get("name", "") for a in (s.get("artists") or [])
-            )
-            items.append(f"{i}. {s.get('name')} - {artists}")
+        items = [self._format_song_brief(i, s) for i, s in enumerate(chunk, start + 1)]
         mid = await self._send_text_list(
             event,
             title,
@@ -1221,6 +1488,12 @@ class NcmDailyPlugin(Star):
             await self.sender.recall_message(event, mid)
 
     # ---------- 格式化 ----------
+
+    @staticmethod
+    def _format_song_brief(index: int, s: dict) -> str:
+        """列表项简洁格式：`序号. 歌名 - 歌手`（歌单/日推/私人FM 的操作列表使用）。"""
+        artists = "、".join(a.get("name", "") for a in (s.get("artists") or []))
+        return f"{index}. {s.get('name', '')} - {artists}"
 
     @staticmethod
     def _format_song(index: int, s: dict) -> str:
